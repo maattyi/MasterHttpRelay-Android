@@ -6,7 +6,6 @@ import androidx.core.content.FileProvider
 import com.velum.vpn.core.LogBus
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.asn1.x509.*
-import org.bouncycastle.cert.X509v3CertificateBuilder
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.jce.provider.BouncyCastleProvider
@@ -27,6 +26,13 @@ import javax.net.ssl.SSLContext
  * store. Instead we expose [exportCertificate] which produces a `.cer`
  * file the user installs via Settings → Security → Install certificate.
  *
+ * Fix #5 (CRITICAL — was instant crash): Android's system "BC" provider
+ * is a stripped-down stub. Looking it up by the string "BC" via
+ * `Security.getProvider("BC")` or `.setProvider("BC")` returns that stub
+ * (or null), and any subsequent BC-specific call hits a missing class /
+ * algorithm and aborts the process. We now instantiate our OWN
+ * BouncyCastleProvider and pass that exact instance into every JCA call.
+ *
  * Fix #6: Use SSLContext.getInstance("TLS") instead of "TLSv1.3" —
  * the umbrella protocol lets JSSE negotiate the best available version
  * and avoids NoSuchAlgorithmException on pre-Q OEMs / BC fallbacks.
@@ -45,13 +51,15 @@ class MitmCa(
 
     companion object {
         private val DEFAULT_PASSWORD = CharArray(0)
-
-        init {
-            if (Security.getProvider("BC") == null) {
-                Security.addProvider(BouncyCastleProvider())
-            }
-        }
     }
+
+    // Fix #5: Our own BouncyCastle provider instance. We DO NOT rely on
+    // Security.getProvider("BC") or pass the string "BC" anywhere — the
+    // system provider with that name is a stub and using it crashes.
+    // We explicitly pass `bcProvider` into every getInstance / setProvider /
+    // KeyStore call so the JCA looks up classes against the correct
+    // ClassLoader (the bundled bcprov-jdk15on dependency).
+    private val bcProvider: BouncyCastleProvider = BouncyCastleProvider()
 
     private val caDir = (caDirOverride ?: File(context.filesDir, "ca")).apply { mkdirs() }
     private val caCertFile = File(caDir, "ca.crt")
@@ -160,7 +168,8 @@ class MitmCa(
     private fun loadOrCreate(): Pair<X509Certificate, PrivateKey> {
         if (caCertFile.exists() && caKeyFile.exists()) {
             try {
-                val ks = KeyStore.getInstance("PKCS12")
+                // Fix #5: Pass our own bcProvider INSTANCE — never the string "BC".
+                val ks = KeyStore.getInstance("PKCS12", bcProvider)
                 ks.load(caCertFile.inputStream(), DEFAULT_PASSWORD)
                 val key = ks.getKey("ca", DEFAULT_PASSWORD) as PrivateKey
                 val cert = ks.getCertificate("ca") as X509Certificate
@@ -189,11 +198,13 @@ class MitmCa(
             .addExtension(Extension.subjectKeyIdentifier, false,
                 org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils().createSubjectKeyIdentifier(kp.public))
 
-        val signer = JcaContentSignerBuilder("SHA256withRSA").setProvider("BC").build(kp.private)
-        val cert = JcaX509CertificateConverter().setProvider("BC")
+        // Fix #5: Pass our bcProvider INSTANCE into setProvider, not the string "BC".
+        val signer = JcaContentSignerBuilder("SHA256withRSA").setProvider(bcProvider).build(kp.private)
+        val cert = JcaX509CertificateConverter().setProvider(bcProvider)
             .getCertificate(builder.build(signer))
 
-        val ks = KeyStore.getInstance("PKCS12").apply { load(null, null) }
+        // Fix #5: KeyStore.getInstance with explicit provider instance.
+        val ks = KeyStore.getInstance("PKCS12", bcProvider).apply { load(null, null) }
         ks.setKeyEntry("ca", kp.private, DEFAULT_PASSWORD, arrayOf(cert))
         caCertFile.outputStream().use { ks.store(it, DEFAULT_PASSWORD) }
         caKeyFile.writeText("STORED_IN_PKCS12")
@@ -239,13 +250,14 @@ class MitmCa(
                 org.bouncycastle.asn1.x509.AuthorityKeyIdentifier(caSkiBytes))
         }
 
-        val signer = JcaContentSignerBuilder("SHA256withRSA").setProvider("BC").build(caKey)
-        val leafCert = JcaX509CertificateConverter().setProvider("BC")
+        // Fix #5: Pass bcProvider INSTANCE everywhere; never the string "BC".
+        val signer = JcaContentSignerBuilder("SHA256withRSA").setProvider(bcProvider).build(caKey)
+        val leafCert = JcaX509CertificateConverter().setProvider(bcProvider)
             .getCertificate(builder.build(signer))
 
         lastLeaf = leafCert
 
-        val ks = KeyStore.getInstance("PKCS12").apply { load(null, null) }
+        val ks = KeyStore.getInstance("PKCS12", bcProvider).apply { load(null, null) }
         ks.setKeyEntry("leaf", kp.private, DEFAULT_PASSWORD, arrayOf(leafCert, caCert))
         val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
         kmf.init(ks, DEFAULT_PASSWORD)

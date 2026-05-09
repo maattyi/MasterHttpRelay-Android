@@ -1,5 +1,50 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Fix for Critical Issue 1 (export cert crash):
+  FileProvider was throwing IllegalArgumentException because the cert
+  files in cacheDir/filesDir didn't fall under any declared root path
+  (some Android builds resolve cacheDir to a parent we hadn't mapped).
+
+  We now grant FileProvider access to ALL the standard app-private roots
+  AND the public Downloads folder so:
+    * Cert export from cacheDir works    -> <cache-path>
+    * Cert export from filesDir works    -> <files-path>
+    * Saving cert to /sdcard/Download/   -> <external-path>
+    * "Save to Downloads" share targets  -> <external-files-path>
+    * Future cache-of-cache use cases    -> <external-cache-path>
+
+  Each entry uses path="." to map the entire root, and a unique `name`
+  attribute (FileProvider URIs are namespaced by name, so duplicates are
+  illegal — that was another silent crash source).
+-->
 <paths>
-    <files-path name="files" path="." />
-    <cache-path name="cache" path="." />
+    <!-- context.filesDir   /data/data/<pkg>/files/ -->
+    <files-path
+        name="files"
+        path="." />
+
+    <!-- context.cacheDir   /data/data/<pkg>/cache/ -->
+    <cache-path
+        name="cache"
+        path="." />
+
+    <!-- Environment.getExternalStorageDirectory()   e.g. /sdcard/ -->
+    <external-path
+        name="external"
+        path="." />
+
+    <!-- context.getExternalFilesDir(null)   /sdcard/Android/data/<pkg>/files/ -->
+    <external-files-path
+        name="external_files"
+        path="." />
+
+    <!-- context.externalCacheDir   /sdcard/Android/data/<pkg>/cache/ -->
+    <external-cache-path
+        name="external_cache"
+        path="." />
+
+    <!-- Public Downloads (Android 11+ scoped storage friendly) -->
+    <external-path
+        name="downloads"
+        path="Download/" />
 </paths>

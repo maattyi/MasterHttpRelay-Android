@@ -18,8 +18,16 @@ import javax.net.ssl.SSLSocketFactory
  * Local HTTP/HTTPS proxy listener.
  * Handles plain HTTP via GAS relay and HTTPS via MITM decryption.
  *
- * Fix #10: Added SO_TIMEOUT on TLS sessions, chunked transfer-encoding
- * body support, and try/finally tls.close() to prevent socket leaks.
+ * Fix #10:
+ *   - Added SO_TIMEOUT (60 s) on every TLS session so idle/abandoned
+ *     clients do not park a coroutine forever waiting on read().
+ *   - Wrapped handshake + read loop in try { … } finally { tls.close() }
+ *     so a thrown exception (handshake failure, disconnect, OOM, …)
+ *     can never leak the SSLSocket. Previously, on handshake failure
+ *     we returned without closing tls, which leaked the underlying
+ *     OS file descriptor and the wrapped `client` Socket.
+ *   - Chunked transfer-encoding body support for both plain HTTP and
+ *     decrypted MITM traffic.
  */
 class HttpProxyServer(
     private val cfg: RelayConfig,
@@ -114,14 +122,20 @@ class HttpProxyServer(
         output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
         output.flush()
 
-        // MITM decryption
+        // MITM decryption — wrap the client TCP socket in our per-host TLS context.
         val ctx = mitm.contextFor(host)
         val ssf: SSLSocketFactory = ctx.socketFactory
         val tls = (ssf.createSocket(client, host, port, true) as SSLSocket).apply {
             useClientMode = false
-            soTimeout = 60_000  // Fix #10: prevent parked coroutines on idle clients
+            // Fix #10: bound idle wait so abandoned clients do not park
+            // a coroutine forever inside read().
+            soTimeout = 60_000
         }
 
+        // Fix #10: every code path below MUST close `tls`. Wrap the entire
+        // handshake-and-read-loop in try { … } finally { tls.close() } so
+        // even a thrown exception, OOM, or coroutine cancellation cannot
+        // leak the SSLSocket / underlying file descriptor.
         try {
             try {
                 tls.startHandshake()
@@ -129,7 +143,8 @@ class HttpProxyServer(
                 val msg = e.message ?: e.toString()
                 LogBus.d(tag, "TLS handshake FAILED for $host: $msg")
                 if (msg.contains("alert", true)) {
-                    LogBus.e(tag, "Client REJECTED certificate for $host. Possible causes: CA not installed, or non-compliant leaf cert.")
+                    LogBus.e(tag, "Client REJECTED certificate for $host. " +
+                        "Possible causes: CA not installed, or non-compliant leaf cert.")
                 }
                 return
             }
@@ -156,7 +171,7 @@ class HttpProxyServer(
                 val rMethod = rParts[0]
                 val rPath = rParts[1]
 
-                // Fix #10: Support chunked transfer-encoding request bodies
+                // Fix #10: chunked transfer-encoding request bodies.
                 val te = rHdrs["transfer-encoding"]?.lowercase()
                 val body = if (te != null && te.contains("chunked")) {
                     readChunkedBody(tlsIn)
@@ -179,14 +194,22 @@ class HttpProxyServer(
                 stats.addDown(bytes.size.toLong())
             }
         } finally {
-            // Fix #10: Always close TLS socket — prevents half-open socket leaks
-            // on handshake failure, client disconnect, or any unexpected throw.
+            // Fix #10: ALWAYS close the TLS socket. runCatching swallows any
+            // close-time IOException so that one failure cannot hide an
+            // earlier, more important one.
             runCatching { tls.close() }
         }
     }
 
-    private suspend fun handleHttp(method: String, url: String, hdrs: Map<String, String>, headerBlock: String, input: InputStream, output: OutputStream) {
-        // Fix #10: Support chunked transfer-encoding for plain HTTP too
+    private suspend fun handleHttp(
+        method: String,
+        url: String,
+        hdrs: Map<String, String>,
+        headerBlock: String,
+        input: InputStream,
+        output: OutputStream,
+    ) {
+        // Fix #10: chunked transfer-encoding for plain HTTP.
         val te = hdrs["transfer-encoding"]?.lowercase()
         val body = if (te != null && te.contains("chunked")) {
             readChunkedBody(input)

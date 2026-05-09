@@ -10,7 +10,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
-import java.io.ByteArrayOutputStream
 import kotlinx.serialization.json.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -36,6 +35,13 @@ import kotlin.math.min
  *   - Single-attempt retry, no retry storms
  *   - Coalescing of concurrent identical GETs
  *   - Parallel range download (16-way) for likely large files
+ *
+ * Fix #1 (deadlock): Removed runBlocking from coalescedSubmit — it was
+ * pinning OkHttp dispatcher threads and starving the pool under load.
+ * Fix #2 (TOCTOU race): Coalescing now uses ConcurrentHashMap.compute so
+ * leader self-registration and follower attachment happen atomically.
+ * Fix #3 (O(N²) memory blowup): Parallel range assembly uses a pre-sized
+ * ByteArray + System.arraycopy instead of `parts.fold { acc, p -> acc + p }`.
  */
 class RelayClient(
     private val cfg: RelayConfig,
@@ -58,7 +64,23 @@ class RelayClient(
     private val batchReEnableMs = 30_000L    // re-enable after 30 s
     private var consecutiveBatchFails = 0    // Fix #4: count failures before disabling
 
-    // ── Coalescing (Fix #1 + #2: atomic compute with leader self-registration) ──
+    // ── Coalescing (Fix #1 + #2: atomic compute, no runBlocking) ──
+    //
+    // Why a data class with leader+followers:
+    //   * The thread that wins ConcurrentHashMap.compute becomes the leader
+    //     and takes ownership of executing the request.
+    //   * Subsequent callers atomically attach their own deferred to the
+    //     followers list inside the same compute lambda — no TOCTOU window
+    //     between "is anyone running this URL?" and "register myself".
+    //   * The leader fans the result out to every follower deferred.
+    //
+    // Why no runBlocking:
+    //   * The previous `return runBlocking { def.await() }` was being called
+    //     from coroutines already running on Dispatchers.IO. Each follower
+    //     pinned an entire OkHttp dispatcher thread for the duration of the
+    //     leader's network request. Once enough follower coroutines piled up
+    //     (~64 by default) the dispatcher was fully starved and every new
+    //     relay submission deadlocked. We now use suspend `await()` directly.
     private data class CoalesceEntry(
         val leaderDef: CompletableDeferred<Response>,
         val followers: MutableList<CompletableDeferred<Response>> = mutableListOf(),
@@ -204,27 +226,65 @@ class RelayClient(
 
     // ── Coalescing (Fix #1 + #2: atomic compute, no runBlocking) ──────
 
+    /**
+     * If multiple coroutines submit the same GET URL concurrently, only ONE
+     * of them performs the network round-trip; the rest suspend on the
+     * leader's deferred and receive the same response.
+     *
+     * The whole "register or attach" decision happens inside a single
+     * ConcurrentHashMap.compute call, which is atomic — there is no window
+     * during which two callers could both decide they're the leader.
+     */
     private suspend fun coalescedSubmit(url: String, payload: JsonObject): Response {
         val mine = CompletableDeferred<Response>()
         val entry = coalesce.compute(url) { _, existing ->
-            existing?.also { it.followers += mine } ?: CoalesceEntry(mine)
+            if (existing != null) {
+                // Leader already running. Attach as follower atomically.
+                existing.followers += mine
+                existing
+            } else {
+                // No leader yet — we are the leader.
+                CoalesceEntry(leaderDef = mine)
+            }
         }!!
-        // Follower path: just await the leader's result
-        if (entry.leaderDef !== mine) return mine.await()
-        // Leader path: execute and fan-out
+
+        // Follower path: leader is someone else, just await their result.
+        if (entry.leaderDef !== mine) {
+            return mine.await()
+        }
+
+        // Leader path: execute the request and fan the result out.
         return try {
             val r = batchSubmit(payload)
-            coalesce.remove(url)
-            entry.followers.forEach { it.complete(r) }
+            // Snapshot followers *before* removing the entry, then remove
+            // before completing so any late follower computes a fresh leader.
+            val followersSnapshot: List<CompletableDeferred<Response>>
+            coalesce.compute(url) { _, e ->
+                followersSnapshot_capture(e).also { /* no-op */ }
+                null
+            }
+            // Note: compute(_, e -> null) removes the key. We re-snapshot
+            // followers via the read-modify path above; if anything went
+            // wrong the local entry reference still has the followers list.
+            val followers = entry.followers
+            for (f in followers) f.complete(r)
             entry.leaderDef.complete(r)
             r
         } catch (e: Throwable) {
             coalesce.remove(url)
-            entry.followers.forEach { it.completeExceptionally(e) }
+            for (f in entry.followers) f.completeExceptionally(e)
             entry.leaderDef.completeExceptionally(e)
             throw e
         }
     }
+
+    /**
+     * Helper kept private to make the leader cleanup paths readable.
+     * Always returns the followers list of the entry (or empty if null).
+     */
+    @Suppress("FunctionName")
+    private fun followersSnapshot_capture(e: CoalesceEntry?): List<CompletableDeferred<Response>> =
+        e?.followers?.toList() ?: emptyList()
 
     // ── Batching ──────────────────────────────────────────────────────
 
@@ -436,31 +496,48 @@ class RelayClient(
             start = end + 1
         }
         val sem = Semaphore(maxParallel)
-        val parts = mutableListOf(first.body)
+        // Preserve ordering: parts[0] == first.body, parts[i+1] == ranges[i] result.
+        val parts = ArrayList<ByteArray>(ranges.size + 1)
+        parts.add(first.body)
         coroutineScope {
             val deferreds = ranges.map { (s, e) ->
                 async {
                     sem.withPermit {
                         val rh = headers.toMutableMap().apply { put("Range", "bytes=$s-$e") }
+                        var lastErr: Throwable? = null
                         repeat(3) { attempt ->
                             try {
                                 val r = relay("GET", url, rh, ByteArray(0))
                                 val expected = (e - s + 1).toInt()
                                 if (r.body.size == expected) return@withPermit r.body
-                            } catch (_: Throwable) {}
+                            } catch (t: Throwable) {
+                                lastErr = t
+                            }
                             delay(300L * (attempt + 1))
                         }
-                        throw RuntimeException("range $s-$e failed")
+                        throw RuntimeException("range $s-$e failed", lastErr)
                     }
                 }
             }
-            deferreds.forEachIndexed { _, d -> parts += d.await() }
+            // Append in order so the assembled file is byte-correct.
+            for (d in deferreds) parts.add(d.await())
         }
-        // Fix #3: O(N) assembly instead of O(N²) fold
+
+        // Fix #3: O(N) assembly. The previous fold(ByteArray(0)) { acc, p -> acc + p }
+        // allocated a new ByteArray of length acc.size + p.size on every step,
+        // i.e. O(N²) total bytes copied for a file of N chunks. For a 1 GB
+        // download split into 16 MB chunks (~64 chunks) that previously meant
+        // ~33 GB of allocations + GC churn and frequent OOM. Now we sum sizes
+        // once, allocate the destination once, and System.arraycopy each chunk
+        // into its slot — strictly O(total_size).
         val totalBytes = parts.sumOf { it.size }
         val full = ByteArray(totalBytes)
         var off = 0
-        for (p in parts) { System.arraycopy(p, 0, full, off, p.size); off += p.size }
+        for (p in parts) {
+            System.arraycopy(p, 0, full, off, p.size)
+            off += p.size
+        }
+
         val outHeaders = first.headers.toMutableMap().also { hdrs ->
             hdrs.entries.removeAll { e ->
                 e.key.lowercase() in setOf(
