@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- VELUM palette (mirrors ui/theme/VelumTheme.kt) -->
+    <color name="pitch_black">#000000</color>
+    <color name="deep_charcoal">#0C0C0C</color>
+    <color name="matte_grey">#1A1A1A</color>
+    <color name="matte_grey_hi">#222222</color>
+    <color name="border_dim">#2A2A2A</color>
+    <color name="neon_green">#B2FF05</color>
+    <color name="neon_green_alt">#CCFF00</color>
+    <color name="neon_green_soft">#1F2A05</color>
+    <color name="warm_amber">#FFE08A</color>
+    <color name="danger_red">#FF4D5E</color>
+    <color name="text_primary">#F5F7F0</color>
+    <color name="text_on_neon">#000000</color>
+</resources>
