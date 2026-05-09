@@ -1,6 +1,7 @@
 package com.velum.vpn.ui.screens
 
 import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -25,10 +26,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.velum.vpn.cert.MitmCa
 import com.velum.vpn.core.AppContainer
 import com.velum.vpn.core.DiagnosticManager
 import com.velum.vpn.core.RelayConfig
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -37,9 +41,12 @@ fun SettingsScreen(container: AppContainer) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var working by remember(current) { mutableStateOf(current) }
+    var lastSave by remember { mutableStateOf<MitmCa.SaveResult?>(null) }
 
     Column(
-        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 18.dp)
             .padding(bottom = 130.dp),
@@ -47,7 +54,7 @@ fun SettingsScreen(container: AppContainer) {
     ) {
         Spacer(Modifier.height(22.dp))
         Text(
-            androidx.compose.ui.res.stringResource(com.velum.vpn.R.string.settings).uppercase(),
+            "SETTINGS",
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.ExtraBold,
@@ -64,13 +71,12 @@ fun SettingsScreen(container: AppContainer) {
         SettingsSection("APPEARANCE") {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Theme", modifier = Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurface)
-                val options = listOf("dark", "light", "system")
-                options.forEach { opt ->
+                listOf("dark", "light", "system").forEach { opt ->
                     FilterChip(
                         selected = working.themeMode == opt,
                         onClick = { working = working.copy(themeMode = opt) },
                         label = { Text(opt.replaceFirstChar { ch -> ch.uppercase() }) },
-                        modifier = Modifier.padding(horizontal = 4.dp)
+                        modifier = Modifier.padding(horizontal = 4.dp),
                     )
                 }
             }
@@ -81,7 +87,7 @@ fun SettingsScreen(container: AppContainer) {
                         selected = working.language == code,
                         onClick = { working = working.copy(language = code) },
                         label = { Text(name) },
-                        modifier = Modifier.padding(horizontal = 4.dp)
+                        modifier = Modifier.padding(horizontal = 4.dp),
                     )
                 }
             }
@@ -146,28 +152,77 @@ fun SettingsScreen(container: AppContainer) {
 
         SettingsSection("CERTIFICATE") {
             Text(
-                "To relay HTTPS, install the Velum Root CA. After exporting, go to: Settings -> " +
-                    "Security -> Encryption & credentials -> Install a certificate -> CA certificate.",
+                "Save the Velum Root CA to your Downloads folder, then install it from " +
+                    "Settings -> Security -> Encryption & credentials -> Install a certificate -> CA certificate.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
             )
-            Spacer(Modifier.height(12.dp))
+
+            // Result panel — green on save, red on failure.
+            val saved = lastSave
+            if (saved != null) {
+                Spacer(Modifier.height(4.dp))
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            if (saved.success) Color(0xFF1B5E20) else Color(0xFFB71C1C),
+                        )
+                        .padding(12.dp),
+                ) {
+                    Column {
+                        Text(
+                            saved.message,
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                        )
+                        val detail = saved.detail
+                        if (!detail.isNullOrBlank()) {
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                detail,
+                                color = Color.White.copy(alpha = 0.85f),
+                                fontSize = 12.sp,
+                                lineHeight = 16.sp,
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 VelumButton(
-                    label = androidx.compose.ui.res.stringResource(com.velum.vpn.R.string.cert_install).uppercase(),
+                    label = "SAVE TO DOWNLOADS",
                     onClick = {
                         scope.launch {
-                            runCatching {
-                                val intent = container.mitm.exportCertificate()
-                                ctx.startActivity(intent)
+                            // Save off the main thread; MediaStore I/O can stutter UI.
+                            val result = withContext(Dispatchers.IO) {
+                                container.mitm.saveCertificateToDownloads()
+                            }
+                            lastSave = result
+                            Toast.makeText(
+                                ctx,
+                                if (result.success) result.message else "Save failed",
+                                Toast.LENGTH_LONG,
+                            ).show()
+
+                            // On success, also fire the system Install Certificate UI.
+                            if (result.success) {
+                                runCatching {
+                                    val intent = container.mitm.exportCertificate()
+                                    ctx.startActivity(intent)
+                                }
                             }
                         }
                     },
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
                 )
                 VelumButton(
-                    label = androidx.compose.ui.res.stringResource(com.velum.vpn.R.string.cert_share).uppercase(),
+                    label = "SHARE",
                     onClick = {
                         scope.launch {
                             runCatching {
@@ -176,7 +231,7 @@ fun SettingsScreen(container: AppContainer) {
                             }
                         }
                     },
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
                 )
             }
 
@@ -202,19 +257,23 @@ fun SettingsScreen(container: AppContainer) {
         SettingsSection("ABOUT") {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable {
-                    runCatching {
-                        ctx.startActivity(
-                            Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/Mattymatins"))
-                        )
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable {
+                        runCatching {
+                            ctx.startActivity(
+                                Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/Mattymatins")),
+                            )
+                        }
                     }
-                }.padding(horizontal = 12.dp, vertical = 8.dp)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
             ) {
                 Icon(
                     Icons.Outlined.Send,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(24.dp)
+                    modifier = Modifier.size(24.dp),
                 )
                 Spacer(Modifier.width(12.dp))
                 Column {
@@ -222,12 +281,12 @@ fun SettingsScreen(container: AppContainer) {
                         "Telegram Channel",
                         color = MaterialTheme.colorScheme.onSurface,
                         fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold
+                        fontWeight = FontWeight.SemiBold,
                     )
                     Text(
                         "@Mattymatins",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 12.sp
+                        fontSize = 12.sp,
                     )
                 }
             }
@@ -258,12 +317,12 @@ private fun DiagnosticsCard(
         "SSL Diagnostics",
         color = MaterialTheme.colorScheme.onSurface,
         fontSize = 14.sp,
-        fontWeight = FontWeight.Bold
+        fontWeight = FontWeight.Bold,
     )
     Text(
         "Probes the local proxy with a real HTTPS request. Make sure the proxy/VPN is running before pressing RUN.",
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        fontSize = 12.sp
+        fontSize = 12.sp,
     )
 
     val r = result
@@ -274,14 +333,14 @@ private fun DiagnosticsCard(
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(12.dp))
                 .background(if (r.success) Color(0xFF1B5E20) else Color(0xFFB71C1C))
-                .padding(12.dp)
+                .padding(12.dp),
         ) {
             Column {
                 Text(
                     if (r.success) "PASS - ${r.message}" else "FAIL - ${r.message}",
                     color = Color.White,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 14.sp
+                    fontSize = 14.sp,
                 )
                 val detail = r.detail
                 if (!detail.isNullOrBlank()) {
@@ -290,7 +349,7 @@ private fun DiagnosticsCard(
                         detail,
                         color = Color.White.copy(alpha = 0.85f),
                         fontSize = 12.sp,
-                        lineHeight = 16.sp
+                        lineHeight = 16.sp,
                     )
                 }
             }
@@ -308,7 +367,7 @@ private fun DiagnosticsCard(
                         DiagnosticManager.Result(
                             success = false,
                             message = "Diagnostic crashed",
-                            detail = e.message ?: e.toString()
+                            detail = e.message ?: e.toString(),
                         )
                     }
                     loading = false
@@ -317,14 +376,14 @@ private fun DiagnosticsCard(
             modifier = Modifier.weight(1f),
             enabled = !loading,
             colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.secondary
-            )
+                containerColor = MaterialTheme.colorScheme.secondary,
+            ),
         ) {
             if (loading) {
                 CircularProgressIndicator(
                     Modifier.size(18.dp),
                     color = Color.White,
-                    strokeWidth = 2.dp
+                    strokeWidth = 2.dp,
                 )
             } else {
                 Text("RUN SSL TEST", fontWeight = FontWeight.Bold)
@@ -334,7 +393,7 @@ private fun DiagnosticsCard(
         OutlinedButton(
             onClick = onDumpLeaf,
             modifier = Modifier.weight(1f),
-            shape = RoundedCornerShape(12.dp)
+            shape = RoundedCornerShape(12.dp),
         ) {
             Text("DUMP LEAF", fontWeight = FontWeight.Bold)
         }
@@ -402,12 +461,12 @@ private fun SettingsSwitchRow(
                 label,
                 color = MaterialTheme.colorScheme.onSurface,
                 fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
             )
             Text(
                 subtitle,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontSize = 12.sp
+                fontSize = 12.sp,
             )
         }
         Switch(

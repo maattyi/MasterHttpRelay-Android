@@ -1,7 +1,11 @@
 package com.velum.vpn.cert
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import androidx.core.content.FileProvider
 import com.velum.vpn.core.LogBus
 import org.bouncycastle.asn1.x500.X500Name
@@ -11,6 +15,7 @@ import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import java.io.File
+import java.io.FileOutputStream
 import java.math.BigInteger
 import java.security.*
 import java.security.cert.X509Certificate
@@ -18,6 +23,11 @@ import java.util.*
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 
+/**
+ * MITM CA. Self-signed root + per-host leaves. BouncyCastle is used via a
+ * private provider INSTANCE we own — never via the string "BC", because
+ * Android's stub provider with that name will crash any BC call.
+ */
 class MitmCa(
     private val context: Context,
     private val fileProviderAuthority: String = "com.velum.vpn.provider",
@@ -25,8 +35,18 @@ class MitmCa(
     private val caDirOverride: File? = null,
 ) {
 
+    /** Result returned by [saveCertificateToDownloads]. */
+    data class SaveResult(
+        val success: Boolean,
+        val displayPath: String,   // user-readable path, e.g. "Downloads/Velum/velum_ca.crt"
+        val message: String,       // headline message ("Saved", "Failed", …)
+        val detail: String? = null,
+    )
+
     companion object {
         private val DEFAULT_PASSWORD = CharArray(0)
+        private const val CERT_FILE_NAME = "velum_ca.crt"
+        private const val DOWNLOADS_SUBDIR = "Velum"
     }
 
     private val bcProvider: BouncyCastleProvider = BouncyCastleProvider()
@@ -41,9 +61,8 @@ class MitmCa(
     private val caKeyFile = File(caDir, "ca.key")
 
     private val cache = object : LinkedHashMap<String, SSLContext>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SSLContext>?): Boolean {
-            return size > 256
-        }
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SSLContext>?): Boolean =
+            size > 256
     }
 
     private val leafKeyPair: KeyPair by lazy {
@@ -58,10 +77,118 @@ class MitmCa(
 
     @Volatile private var lastLeaf: X509Certificate? = null
 
+    // ─────────────────────────────────────────────────────────────────────
+    //  Public API: cert export & share
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Save the root CA certificate directly to the device's public
+     * Downloads folder under "Downloads/Velum/velum_ca.crt".
+     *
+     * Uses MediaStore on Android 10+ (no permission required) and the
+     * legacy public path on Android 9 and below.
+     *
+     * Returns a [SaveResult] the UI can use to show a toast / snackbar.
+     * After this, the user opens Settings -> Security -> Encryption &
+     * credentials -> Install a certificate -> CA certificate, picks the
+     * file from Downloads/Velum/, and the cert is installed.
+     */
+    fun saveCertificateToDownloads(): SaveResult {
+        return try {
+            val bytes = caCert.encoded
+            val displayPath = "Downloads/$DOWNLOADS_SUBDIR/$CERT_FILE_NAME"
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10+ : MediaStore (scoped storage, no permission needed)
+                val resolver = context.contentResolver
+                val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+
+                // Delete any previous copy so the file is always fresh.
+                runCatching {
+                    resolver.delete(
+                        collection,
+                        "${MediaStore.Downloads.RELATIVE_PATH}=? AND " +
+                            "${MediaStore.Downloads.DISPLAY_NAME}=?",
+                        arrayOf(
+                            "${Environment.DIRECTORY_DOWNLOADS}/$DOWNLOADS_SUBDIR/",
+                            CERT_FILE_NAME,
+                        ),
+                    )
+                }
+
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, CERT_FILE_NAME)
+                    put(MediaStore.Downloads.MIME_TYPE, "application/x-x509-ca-cert")
+                    put(
+                        MediaStore.Downloads.RELATIVE_PATH,
+                        "${Environment.DIRECTORY_DOWNLOADS}/$DOWNLOADS_SUBDIR",
+                    )
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+
+                val uri = resolver.insert(collection, values)
+                    ?: return SaveResult(
+                        success = false,
+                        displayPath = displayPath,
+                        message = "Could not create file in Downloads",
+                        detail = "MediaStore.insert returned null. The system may have " +
+                            "denied access. Try Share instead.",
+                    )
+
+                resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                    ?: throw IllegalStateException("openOutputStream returned null for $uri")
+
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+
+                LogBus.i("Cert", "CA cert saved to $displayPath via MediaStore")
+                SaveResult(
+                    success = true,
+                    displayPath = displayPath,
+                    message = "Saved to $displayPath",
+                    detail = "Now go to Settings -> Security -> Encryption & credentials -> " +
+                        "Install a certificate -> CA certificate, then pick this file.",
+                )
+            } else {
+                // Android 9 and below: legacy public Downloads path.
+                @Suppress("DEPRECATION")
+                val downloads = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS,
+                )
+                val targetDir = File(downloads, DOWNLOADS_SUBDIR).apply { mkdirs() }
+                val target = File(targetDir, CERT_FILE_NAME)
+                FileOutputStream(target).use { it.write(bytes) }
+
+                LogBus.i("Cert", "CA cert saved to ${target.absolutePath} (legacy)")
+                SaveResult(
+                    success = true,
+                    displayPath = displayPath,
+                    message = "Saved to $displayPath",
+                    detail = "Now go to Settings -> Security -> Install certificate, " +
+                        "then pick this file.",
+                )
+            }
+        } catch (e: Throwable) {
+            LogBus.e("Cert", "saveCertificateToDownloads failed", e)
+            SaveResult(
+                success = false,
+                displayPath = "Downloads/$DOWNLOADS_SUBDIR/$CERT_FILE_NAME",
+                message = "Save failed",
+                detail = (e.message ?: e.toString()).take(400),
+            )
+        }
+    }
+
+    /**
+     * Build an [Intent] that hands the file to the system "Install
+     * certificate" UI directly. Used as a follow-up after
+     * [saveCertificateToDownloads] so the user can tap "Install now".
+     */
     fun exportCertificate(): Intent {
         return try {
-            LogBus.i("Cert", "Exporting root CA certificate for installation")
-            val certFile = File(context.cacheDir, "velum_ca.crt").apply {
+            LogBus.i("Cert", "Building cert install intent")
+            val certFile = File(context.cacheDir, CERT_FILE_NAME).apply {
                 writeBytes(caCert.encoded)
             }
             val uri = FileProvider.getUriForFile(context, fileProviderAuthority, certFile)
@@ -71,7 +198,7 @@ class MitmCa(
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         } catch (e: Throwable) {
-            LogBus.e("Cert", "Failed to create cert export intent", e)
+            LogBus.e("Cert", "exportCertificate failed", e)
             try {
                 android.security.KeyChain.createInstallIntent().apply {
                     putExtra(android.security.KeyChain.EXTRA_CERTIFICATE, caCert.encoded)
@@ -79,16 +206,16 @@ class MitmCa(
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
             } catch (e2: Throwable) {
-                LogBus.e("Cert", "Fallback cert export also failed", e2)
+                LogBus.e("Cert", "Fallback cert install intent failed", e2)
                 Intent()
             }
         }
     }
 
+    /** Share the cert file (Telegram, Drive, etc.). Kept as a backup option. */
     fun shareCertificate(): Intent {
         return try {
-            LogBus.i("Cert", "Sharing root CA certificate file")
-            val certFile = File(context.cacheDir, "velum_ca.crt").apply {
+            val certFile = File(context.cacheDir, CERT_FILE_NAME).apply {
                 writeBytes(caCert.encoded)
             }
             val uri = FileProvider.getUriForFile(context, fileProviderAuthority, certFile)
@@ -99,7 +226,7 @@ class MitmCa(
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         } catch (e: Throwable) {
-            LogBus.e("Cert", "Failed to share certificate", e)
+            LogBus.e("Cert", "shareCertificate failed", e)
             Intent()
         }
     }
@@ -109,7 +236,7 @@ class MitmCa(
         return try {
             cache.getOrPut(host) { sign(host) }
         } catch (e: Throwable) {
-            LogBus.e("Cert", "contextFor($host) failed, retrying with fallback host", e)
+            LogBus.e("Cert", "contextFor($host) failed, using fallback", e)
             cache.getOrPut("fallback") { sign("fallback.local") }
         }
     }
@@ -121,7 +248,7 @@ class MitmCa(
                 writeText(
                     "-----BEGIN CERTIFICATE-----\n" +
                         android.util.Base64.encodeToString(leaf.encoded, android.util.Base64.DEFAULT) +
-                        "-----END CERTIFICATE-----\n"
+                        "-----END CERTIFICATE-----\n",
                 )
             }
             val uri = FileProvider.getUriForFile(context, fileProviderAuthority, file)
@@ -132,10 +259,14 @@ class MitmCa(
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         } catch (e: Throwable) {
-            LogBus.e("Cert", "Failed to dump leaf", e)
+            LogBus.e("Cert", "dumpLastLeaf failed", e)
             null
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  CA load / generate
+    // ─────────────────────────────────────────────────────────────────────
 
     private fun loadOrCreate(): Pair<X509Certificate, PrivateKey> {
         if (caCertFile.exists() && caKeyFile.exists()) {
@@ -144,9 +275,7 @@ class MitmCa(
                 ks.load(caCertFile.inputStream(), DEFAULT_PASSWORD)
                 val key = ks.getKey("ca", DEFAULT_PASSWORD) as? PrivateKey
                 val cert = ks.getCertificate("ca") as? X509Certificate
-                if (key != null && cert != null) {
-                    return cert to key
-                }
+                if (key != null && cert != null) return cert to key
             } catch (e: Throwable) {
                 LogBus.w("Cert", "Failed to load existing CA, regenerating: ${e.message}")
                 runCatching { caCertFile.delete() }
@@ -167,12 +296,12 @@ class MitmCa(
             .addExtension(Extension.basicConstraints, true, BasicConstraints(true))
             .addExtension(
                 Extension.keyUsage, true,
-                KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyCertSign or KeyUsage.cRLSign)
+                KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyCertSign or KeyUsage.cRLSign),
             )
             .addExtension(
                 Extension.subjectKeyIdentifier, false,
                 org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils()
-                    .createSubjectKeyIdentifier(kp.public)
+                    .createSubjectKeyIdentifier(kp.public),
             )
 
         val signer = JcaContentSignerBuilder("SHA256withRSA")
@@ -218,21 +347,21 @@ class MitmCa(
             .addExtension(Extension.subjectAlternativeName, true, GeneralNames(san))
             .addExtension(
                 Extension.extendedKeyUsage, false,
-                ExtendedKeyUsage(KeyPurposeId.id_kp_serverAuth)
+                ExtendedKeyUsage(KeyPurposeId.id_kp_serverAuth),
             )
             .addExtension(
                 Extension.keyUsage, true,
-                KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyEncipherment)
+                KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyEncipherment),
             )
             .addExtension(
                 Extension.subjectKeyIdentifier, false,
-                utils.createSubjectKeyIdentifier(kp.public)
+                utils.createSubjectKeyIdentifier(kp.public),
             )
 
         if (caSkiBytes != null) {
             builder.addExtension(
                 Extension.authorityKeyIdentifier, false,
-                org.bouncycastle.asn1.x509.AuthorityKeyIdentifier(caSkiBytes)
+                org.bouncycastle.asn1.x509.AuthorityKeyIdentifier(caSkiBytes),
             )
         }
 

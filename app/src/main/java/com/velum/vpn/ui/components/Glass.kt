@@ -4,7 +4,6 @@ import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -13,6 +12,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.asComposeRenderEffect   // ← THE MISSING IMPORT
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -20,13 +20,10 @@ import androidx.compose.ui.unit.dp
 /**
  * Glassmorphism wrapper.
  *
- * CRITICAL FIX: The previous implementation attached
- * RenderEffect.createBlurEffect to the SAME Box that hosts the content,
- * which blurred every card's text, icons and chart strokes by 24 px on
- * Android 12+ (the visible "everything is unreadable" bug).
- *
- * Correct glassmorphism applies blur to a *decorative ambient backdrop*
- * that sits BEHIND the content, never to the content itself.
+ * Blur is applied ONLY to a decorative ambient backdrop layer that sits
+ * behind the content — never to the content itself. This is the difference
+ * between a real glass effect and the previous bug where every card's
+ * text/icons were blurred to mush.
  */
 @Composable
 fun GlassSurface(
@@ -73,7 +70,7 @@ fun GlassSurface(
                 ),
         )
 
-        // Layer 2 — content. Crisp, never blurred.
+        // Layer 2 — content. Always crisp.
         Box(modifier = Modifier.padding(contentPadding)) {
             content()
         }
