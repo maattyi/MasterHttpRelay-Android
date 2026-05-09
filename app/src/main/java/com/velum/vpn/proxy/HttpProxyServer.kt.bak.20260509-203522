@@ -14,6 +14,21 @@ import java.io.OutputStream
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
+/**
+ * Local HTTP/HTTPS proxy listener.
+ * Handles plain HTTP via GAS relay and HTTPS via MITM decryption.
+ *
+ * Fix #10:
+ *   - Added SO_TIMEOUT (60 s) on every TLS session so idle/abandoned
+ *     clients do not park a coroutine forever waiting on read().
+ *   - Wrapped handshake + read loop in try { … } finally { tls.close() }
+ *     so a thrown exception (handshake failure, disconnect, OOM, …)
+ *     can never leak the SSLSocket. Previously, on handshake failure
+ *     we returned without closing tls, which leaked the underlying
+ *     OS file descriptor and the wrapped `client` Socket.
+ *   - Chunked transfer-encoding body support for both plain HTTP and
+ *     decrypted MITM traffic.
+ */
 class HttpProxyServer(
     private val cfg: RelayConfig,
     private val relay: RelayClient,
@@ -38,16 +53,16 @@ class HttpProxyServer(
             isRunning = true
             scope.launch { acceptLoop(s) }
             LogBus.i(tag, "HTTP proxy listening on $bind:${cfg.listenPort}")
-        } catch (e: Throwable) {
+        } catch (e: Exception) {
             LogBus.e(tag, "Failed to start HTTP proxy", e)
         }
     }
 
     fun stop() {
         isRunning = false
-        runCatching { server?.close() }
+        try { server?.close() } catch (_: Throwable) {}
         server = null
-        runCatching { scope.cancel() }
+        scope.cancel()
     }
 
     private suspend fun acceptLoop(s: ServerSocket) {
@@ -57,8 +72,8 @@ class HttpProxyServer(
             scope.launch {
                 try {
                     handleClient(client)
-                } catch (e: Throwable) {
-                    if (e !is CancellationException) {
+                } catch (e: Exception) {
+                    if (e !is kotlinx.coroutines.CancellationException) {
                         LogBus.d(tag, "client session error: ${e.message}")
                     }
                 } finally {
@@ -70,7 +85,7 @@ class HttpProxyServer(
     }
 
     private suspend fun handleClient(client: Socket) {
-        runCatching { client.tcpNoDelay = true }
+        client.tcpNoDelay = true
         val input = client.getInputStream()
         val output = client.getOutputStream()
 
@@ -100,41 +115,27 @@ class HttpProxyServer(
         }
     }
 
-    private suspend fun handleConnect(
-        target: String,
-        client: Socket,
-        input: InputStream,
-        output: OutputStream,
-    ) {
+    private suspend fun handleConnect(target: String, client: Socket, input: InputStream, output: OutputStream) {
         val (host, port) = parseHostPort(target, 443)
         LogBus.i(tag, "CONNECT -> $host:$port")
 
-        try {
-            output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
-            output.flush()
-        } catch (e: Throwable) {
-            LogBus.d(tag, "Failed to send CONNECT 200: ${e.message}")
-            return
-        }
+        output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+        output.flush()
 
-        val ctx = try {
-            mitm.contextFor(host)
-        } catch (e: Throwable) {
-            LogBus.e(tag, "MITM context generation failed for $host: ${e.message}", e)
-            return
-        }
-
+        // MITM decryption — wrap the client TCP socket in our per-host TLS context.
+        val ctx = mitm.contextFor(host)
         val ssf: SSLSocketFactory = ctx.socketFactory
-        val tls: SSLSocket = try {
-            (ssf.createSocket(client, host, port, true) as SSLSocket).apply {
-                useClientMode = false
-                soTimeout = 60_000
-            }
-        } catch (e: Throwable) {
-            LogBus.e(tag, "Failed to wrap socket in TLS for $host: ${e.message}", e)
-            return
+        val tls = (ssf.createSocket(client, host, port, true) as SSLSocket).apply {
+            useClientMode = false
+            // Fix #10: bound idle wait so abandoned clients do not park
+            // a coroutine forever inside read().
+            soTimeout = 60_000
         }
 
+        // Fix #10: every code path below MUST close `tls`. Wrap the entire
+        // handshake-and-read-loop in try { … } finally { tls.close() } so
+        // even a thrown exception, OOM, or coroutine cancellation cannot
+        // leak the SSLSocket / underlying file descriptor.
         try {
             try {
                 tls.startHandshake()
@@ -142,11 +143,8 @@ class HttpProxyServer(
                 val msg = e.message ?: e.toString()
                 LogBus.d(tag, "TLS handshake FAILED for $host: $msg")
                 if (msg.contains("alert", true)) {
-                    LogBus.e(
-                        tag,
-                        "Client REJECTED certificate for $host. Causes: CA not installed, " +
-                            "non-compliant leaf, or cert pinning."
-                    )
+                    LogBus.e(tag, "Client REJECTED certificate for $host. " +
+                        "Possible causes: CA not installed, or non-compliant leaf cert.")
                 }
                 return
             }
@@ -165,10 +163,7 @@ class HttpProxyServer(
                     sb.append(line).append("\r\n")
                     if (line.isEmpty()) break
                     val sep = line.indexOf(':')
-                    if (sep > 0) {
-                        rHdrs[line.substring(0, sep).trim().lowercase()] =
-                            line.substring(sep + 1).trim()
-                    }
+                    if (sep > 0) rHdrs[line.substring(0, sep).trim().lowercase()] = line.substring(sep + 1).trim()
                 }
 
                 val rParts = firstReq.split(" ", limit = 3)
@@ -176,34 +171,32 @@ class HttpProxyServer(
                 val rMethod = rParts[0]
                 val rPath = rParts[1]
 
+                // Fix #10: chunked transfer-encoding request bodies.
                 val te = rHdrs["transfer-encoding"]?.lowercase()
                 val body = if (te != null && te.contains("chunked")) {
-                    runCatching { readChunkedBody(tlsIn) }.getOrDefault(ByteArray(0))
+                    readChunkedBody(tlsIn)
                 } else {
                     val cl = rHdrs["content-length"]?.toIntOrNull() ?: 0
-                    if (cl > 0) runCatching { readNBytesCompat(tlsIn, cl) }.getOrDefault(ByteArray(0))
-                    else ByteArray(0)
+                    if (cl > 0) readNBytesCompat(tlsIn, cl) else ByteArray(0)
                 }
                 stats.addUp(sb.length.toLong() + body.size)
 
                 val url = if (port == 443) "https://$host$rPath" else "https://$host:$port$rPath"
                 val resp = try {
                     relay.relaySmart(rMethod, url, rHdrs, body)
-                } catch (e: Throwable) {
+                } catch (e: Exception) {
                     com.velum.vpn.net.Response.error(502, "relay error: ${e.message}")
                 }
 
-                try {
-                    val bytes = resp.toHttpBytes()
-                    tlsOut.write(bytes)
-                    tlsOut.flush()
-                    stats.addDown(bytes.size.toLong())
-                } catch (e: Throwable) {
-                    LogBus.d(tag, "TLS write failed for $host: ${e.message}")
-                    break
-                }
+                val bytes = resp.toHttpBytes()
+                tlsOut.write(bytes)
+                tlsOut.flush()
+                stats.addDown(bytes.size.toLong())
             }
         } finally {
+            // Fix #10: ALWAYS close the TLS socket. runCatching swallows any
+            // close-time IOException so that one failure cannot hide an
+            // earlier, more important one.
             runCatching { tls.close() }
         }
     }
@@ -216,39 +209,32 @@ class HttpProxyServer(
         input: InputStream,
         output: OutputStream,
     ) {
+        // Fix #10: chunked transfer-encoding for plain HTTP.
         val te = hdrs["transfer-encoding"]?.lowercase()
         val body = if (te != null && te.contains("chunked")) {
-            runCatching { readChunkedBody(input) }.getOrDefault(ByteArray(0))
+            readChunkedBody(input)
         } else {
             val cl = hdrs["content-length"]?.toIntOrNull() ?: 0
-            if (cl > 0) runCatching { readNBytesCompat(input, cl) }.getOrDefault(ByteArray(0))
-            else ByteArray(0)
+            if (cl > 0) readNBytesCompat(input, cl) else ByteArray(0)
         }
         stats.addUp(headerBlock.length.toLong() + body.size)
 
         val resp = try {
             relay.relaySmart(method, url, hdrs, body)
-        } catch (e: Throwable) {
+        } catch (e: Exception) {
             com.velum.vpn.net.Response.error(502, "relay error: ${e.message}")
         }
 
-        try {
-            val bytes = resp.toHttpBytes()
-            output.write(bytes)
-            output.flush()
-            stats.addDown(bytes.size.toLong())
-        } catch (e: Throwable) {
-            LogBus.d(tag, "HTTP write failed: ${e.message}")
-        }
+        val bytes = resp.toHttpBytes()
+        output.write(bytes)
+        output.flush()
+        stats.addDown(bytes.size.toLong())
     }
 
     private fun parseHostPort(spec: String, defaultPort: Int): Pair<String, Int> {
         val idx = spec.lastIndexOf(':')
-        return if (idx > 0) {
-            spec.substring(0, idx) to (spec.substring(idx + 1).toIntOrNull() ?: defaultPort)
-        } else {
-            spec to defaultPort
-        }
+        return if (idx > 0) spec.substring(0, idx) to (spec.substring(idx + 1).toIntOrNull() ?: defaultPort)
+               else spec to defaultPort
     }
 
     private fun readNBytesCompat(input: InputStream, n: Int): ByteArray {
@@ -256,24 +242,33 @@ class HttpProxyServer(
         val buffer = ByteArray(n)
         var offset = 0
         while (offset < n) {
-            val read = try { input.read(buffer, offset, n - offset) } catch (_: Throwable) { -1 }
-            if (read == -1) return buffer.copyOf(offset)
+            val read = input.read(buffer, offset, n - offset)
+            if (read == -1) {
+                return buffer.copyOf(offset)
+            }
             offset += read
         }
         return buffer
     }
 
+    /**
+     * Fix #10: Read HTTP chunked transfer-encoding body.
+     * Parses chunk-size lines, reads chunk-data + CRLF per chunk,
+     * and concatenates into a single ByteArray.
+     */
     private fun readChunkedBody(input: InputStream): ByteArray {
         val chunks = mutableListOf<ByteArray>()
         while (true) {
             val sizeLine = readLine(input) ?: break
             val chunkSize = sizeLine.trim().substringBefore(';').toIntOrNull(16) ?: 0
             if (chunkSize == 0) {
+                // Read trailing CRLF after last chunk
                 readLine(input)
                 break
             }
             val chunk = readNBytesCompat(input, chunkSize)
             chunks += chunk
+            // Read CRLF after chunk data
             readLine(input)
         }
         val total = chunks.sumOf { it.size }
@@ -289,13 +284,14 @@ class HttpProxyServer(
     private fun readLine(input: InputStream): String? {
         val out = java.io.ByteArrayOutputStream()
         while (true) {
-            val b = try { input.read() } catch (_: Throwable) { return null }
+            val b = input.read()
             if (b < 0) return if (out.size() == 0) null else out.toString()
             if (b == '\n'.code) {
-                return out.toString().trimEnd('\r')
+                val res = out.toString().trimEnd('\r')
+                return res
             }
             out.write(b)
-            if (out.size() > 16384) break
+            if (out.size() > 16384) break // Limit line length
         }
         return out.toString()
     }

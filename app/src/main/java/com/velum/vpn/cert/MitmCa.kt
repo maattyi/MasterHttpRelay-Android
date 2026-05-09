@@ -18,30 +18,6 @@ import java.util.*
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 
-/**
- * Generates and caches a self-signed root CA on first use, plus per-host
- * leaf certificates. Mirrors the Python MITMCertManager.
- *
- * Android does not let user apps add a root CA to the *system* trust
- * store. Instead we expose [exportCertificate] which produces a `.cer`
- * file the user installs via Settings → Security → Install certificate.
- *
- * Fix #5 (CRITICAL — was instant crash): Android's system "BC" provider
- * is a stripped-down stub. Looking it up by the string "BC" via
- * `Security.getProvider("BC")` or `.setProvider("BC")` returns that stub
- * (or null), and any subsequent BC-specific call hits a missing class /
- * algorithm and aborts the process. We now instantiate our OWN
- * BouncyCastleProvider and pass that exact instance into every JCA call.
- *
- * Fix #6: Use SSLContext.getInstance("TLS") instead of "TLSv1.3" —
- * the umbrella protocol lets JSSE negotiate the best available version
- * and avoids NoSuchAlgorithmException on pre-Q OEMs / BC fallbacks.
- *
- * Fix #7: LRU-bounded leaf cache (max 256 entries) + shared EC P-256
- * leaf keypair (generated once, reused for all leaf certs). This cuts
- * handshake setup from ~600 ms to ~25 ms and prevents unbounded memory
- * growth on long sessions.
- */
 class MitmCa(
     private val context: Context,
     private val fileProviderAuthority: String = "com.velum.vpn.provider",
@@ -53,183 +29,185 @@ class MitmCa(
         private val DEFAULT_PASSWORD = CharArray(0)
     }
 
-    // Fix #5: Our own BouncyCastle provider instance. We DO NOT rely on
-    // Security.getProvider("BC") or pass the string "BC" anywhere — the
-    // system provider with that name is a stub and using it crashes.
-    // We explicitly pass `bcProvider` into every getInstance / setProvider /
-    // KeyStore call so the JCA looks up classes against the correct
-    // ClassLoader (the bundled bcprov-jdk15on dependency).
     private val bcProvider: BouncyCastleProvider = BouncyCastleProvider()
 
-    private val caDir = (caDirOverride ?: File(context.filesDir, "ca")).apply { mkdirs() }
+    private val caDir: File = try {
+        (caDirOverride ?: File(context.filesDir, "ca")).apply { mkdirs() }
+    } catch (e: Throwable) {
+        LogBus.e("Cert", "Cannot create CA dir, falling back to cacheDir", e)
+        File(context.cacheDir, "ca").apply { runCatching { mkdirs() } }
+    }
     private val caCertFile = File(caDir, "ca.crt")
     private val caKeyFile = File(caDir, "ca.key")
 
-    // Fix #7: LRU-bounded cache with access-order eviction (max 256 entries)
     private val cache = object : LinkedHashMap<String, SSLContext>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SSLContext>?): Boolean {
             return size > 256
         }
     }
 
-    // Fix #7: Single shared leaf keypair — generated once, reused for all hosts.
-    // Browsers verify the chain, not key uniqueness. Switching to EC P-256
-    // makes keygen ~50× faster than RSA-2048 (~12 ms vs ~600 ms on Pixel 7).
     private val leafKeyPair: KeyPair by lazy {
         val kpg = KeyPairGenerator.getInstance("EC")
         kpg.initialize(java.security.spec.ECGenParameterSpec("secp256r1"))
         kpg.generateKeyPair()
     }
 
-    private val caPair = loadOrCreate()
+    private val caPair: Pair<X509Certificate, PrivateKey> = loadOrCreate()
     private val caCert: X509Certificate get() = caPair.first
     private val caKey: PrivateKey get() = caPair.second
 
     @Volatile private var lastLeaf: X509Certificate? = null
 
     fun exportCertificate(): Intent {
-        LogBus.i("Cert", "Exporting root CA certificate for installation")
-
-        try {
-            val certFile = File(context.cacheDir, "velum_ca.crt")
-            certFile.writeBytes(caCert.encoded)
-
+        return try {
+            LogBus.i("Cert", "Exporting root CA certificate for installation")
+            val certFile = File(context.cacheDir, "velum_ca.crt").apply {
+                writeBytes(caCert.encoded)
+            }
             val uri = FileProvider.getUriForFile(context, fileProviderAuthority, certFile)
-
-            val intent = Intent(Intent.ACTION_VIEW)
-            intent.setDataAndType(uri, "application/x-x509-ca-cert")
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            return intent
-        } catch (e: Exception) {
-            LogBus.e("Cert", "Failed to create certificate export intent", e)
-            return try {
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/x-x509-ca-cert")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        } catch (e: Throwable) {
+            LogBus.e("Cert", "Failed to create cert export intent", e)
+            try {
                 android.security.KeyChain.createInstallIntent().apply {
                     putExtra(android.security.KeyChain.EXTRA_CERTIFICATE, caCert.encoded)
                     putExtra(android.security.KeyChain.EXTRA_NAME, caCommonName)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
-            } catch (e2: Exception) {
-                LogBus.e("Cert", "Fallback certificate export also failed", e2)
+            } catch (e2: Throwable) {
+                LogBus.e("Cert", "Fallback cert export also failed", e2)
                 Intent()
             }
         }
     }
 
-    /**
-     * Share the certificate file so the user can save it to Downloads or Send to themselves.
-     * This is often more reliable than ACTION_VIEW on Android 11+.
-     */
     fun shareCertificate(): Intent {
-        LogBus.i("Cert", "Sharing root CA certificate file")
-        try {
-            val certFile = File(context.cacheDir, "velum_ca.crt")
-            certFile.writeBytes(caCert.encoded)
+        return try {
+            LogBus.i("Cert", "Sharing root CA certificate file")
+            val certFile = File(context.cacheDir, "velum_ca.crt").apply {
+                writeBytes(caCert.encoded)
+            }
             val uri = FileProvider.getUriForFile(context, fileProviderAuthority, certFile)
-
-            return Intent(Intent.ACTION_SEND).apply {
+            Intent(Intent.ACTION_SEND).apply {
                 type = "application/x-x509-ca-cert"
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             LogBus.e("Cert", "Failed to share certificate", e)
-            return Intent()
+            Intent()
         }
     }
 
     @Synchronized
-    fun contextFor(host: String): SSLContext = cache.getOrPut(host) { sign(host) }
+    fun contextFor(host: String): SSLContext {
+        return try {
+            cache.getOrPut(host) { sign(host) }
+        } catch (e: Throwable) {
+            LogBus.e("Cert", "contextFor($host) failed, retrying with fallback host", e)
+            cache.getOrPut("fallback") { sign("fallback.local") }
+        }
+    }
 
-    /**
-     * Dumps the last generated leaf certificate to a shareable file (Stage 0.1).
-     */
     fun dumpLastLeaf(): Intent? {
         val leaf = lastLeaf ?: return null
-        try {
-            val file = File(context.cacheDir, "last_leaf.crt")
-            file.writeText("-----BEGIN CERTIFICATE-----\n" +
-                android.util.Base64.encodeToString(leaf.encoded, android.util.Base64.DEFAULT) +
-                "-----END CERTIFICATE-----\n")
+        return try {
+            val file = File(context.cacheDir, "last_leaf.crt").apply {
+                writeText(
+                    "-----BEGIN CERTIFICATE-----\n" +
+                        android.util.Base64.encodeToString(leaf.encoded, android.util.Base64.DEFAULT) +
+                        "-----END CERTIFICATE-----\n"
+                )
+            }
             val uri = FileProvider.getUriForFile(context, fileProviderAuthority, file)
-            return Intent(Intent.ACTION_SEND).apply {
+            Intent(Intent.ACTION_SEND).apply {
                 type = "application/x-x509-ca-cert"
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             LogBus.e("Cert", "Failed to dump leaf", e)
-            return null
+            null
         }
     }
 
     private fun loadOrCreate(): Pair<X509Certificate, PrivateKey> {
         if (caCertFile.exists() && caKeyFile.exists()) {
             try {
-                // Fix #5: Pass our own bcProvider INSTANCE — never the string "BC".
                 val ks = KeyStore.getInstance("PKCS12", bcProvider)
                 ks.load(caCertFile.inputStream(), DEFAULT_PASSWORD)
-                val key = ks.getKey("ca", DEFAULT_PASSWORD) as PrivateKey
-                val cert = ks.getCertificate("ca") as X509Certificate
-                return cert to key
-            } catch (_: Throwable) {
-                // Fall through and regenerate on any load failure
+                val key = ks.getKey("ca", DEFAULT_PASSWORD) as? PrivateKey
+                val cert = ks.getCertificate("ca") as? X509Certificate
+                if (key != null && cert != null) {
+                    return cert to key
+                }
+            } catch (e: Throwable) {
+                LogBus.w("Cert", "Failed to load existing CA, regenerating: ${e.message}")
                 runCatching { caCertFile.delete() }
                 runCatching { caKeyFile.delete() }
             }
         }
+
         val kpg = KeyPairGenerator.getInstance("RSA").apply { initialize(3072) }
         val kp = kpg.generateKeyPair()
         val name = X500Name("CN=$caCommonName, O=VelumVPN")
         val notBefore = Date(System.currentTimeMillis() - 24 * 3600 * 1000L)
         val notAfter = Date(System.currentTimeMillis() + 3650L * 24 * 3600 * 1000L)
-
-        // High entropy positive serial
         val serial = BigInteger(159, SecureRandom()).abs()
 
         val builder = JcaX509v3CertificateBuilder(
             name, serial, notBefore, notAfter, name, kp.public,
         )
             .addExtension(Extension.basicConstraints, true, BasicConstraints(true))
-            .addExtension(Extension.keyUsage, true,
-                KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyCertSign or KeyUsage.cRLSign))
-            .addExtension(Extension.subjectKeyIdentifier, false,
-                org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils().createSubjectKeyIdentifier(kp.public))
+            .addExtension(
+                Extension.keyUsage, true,
+                KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyCertSign or KeyUsage.cRLSign)
+            )
+            .addExtension(
+                Extension.subjectKeyIdentifier, false,
+                org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils()
+                    .createSubjectKeyIdentifier(kp.public)
+            )
 
-        // Fix #5: Pass our bcProvider INSTANCE into setProvider, not the string "BC".
-        val signer = JcaContentSignerBuilder("SHA256withRSA").setProvider(bcProvider).build(kp.private)
-        val cert = JcaX509CertificateConverter().setProvider(bcProvider)
+        val signer = JcaContentSignerBuilder("SHA256withRSA")
+            .setProvider(bcProvider)
+            .build(kp.private)
+        val cert = JcaX509CertificateConverter()
+            .setProvider(bcProvider)
             .getCertificate(builder.build(signer))
 
-        // Fix #5: KeyStore.getInstance with explicit provider instance.
         val ks = KeyStore.getInstance("PKCS12", bcProvider).apply { load(null, null) }
         ks.setKeyEntry("ca", kp.private, DEFAULT_PASSWORD, arrayOf(cert))
         caCertFile.outputStream().use { ks.store(it, DEFAULT_PASSWORD) }
-        caKeyFile.writeText("STORED_IN_PKCS12")
+        runCatching { caKeyFile.writeText("STORED_IN_PKCS12") }
         return cert to kp.private
     }
 
     private fun sign(host: String): SSLContext {
-        // Fix #7: Reuse shared EC P-256 leaf keypair instead of generating RSA-2048 per host.
-        // Key generation drops from ~600 ms to ~12 ms and the key is only created once.
         val kp = leafKeyPair
+        val safeHost = host.ifBlank { "localhost" }.take(253)
 
-        val subject = X500Name("CN=${host.take(64)}")
+        val subject = X500Name("CN=${safeHost.take(64)}")
         val notBefore = Date(System.currentTimeMillis() - 24 * 3600 * 1000L)
         val notAfter = Date(System.currentTimeMillis() + 375L * 24 * 3600 * 1000L)
 
-        val isIp = host.matches(Regex("^[0-9.]+$")) || host.contains(':')
-        val san = if (isIp) GeneralName(GeneralName.iPAddress, host)
-                  else GeneralName(GeneralName.dNSName, host)
+        val isIp = safeHost.matches(Regex("^[0-9.]+$")) || safeHost.contains(':')
+        val san = if (isIp) GeneralName(GeneralName.iPAddress, safeHost)
+        else GeneralName(GeneralName.dNSName, safeHost)
 
         val utils = org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils()
 
-        // Exact AKI matching: extract SKI bytes from CA cert
-        val caSkiBytes = caCert.getExtensionValue(Extension.subjectKeyIdentifier.id)?.let {
-            org.bouncycastle.asn1.ASN1OctetString.getInstance(it).octets
-        }
+        val caSkiBytes: ByteArray? = try {
+            caCert.getExtensionValue(Extension.subjectKeyIdentifier.id)?.let {
+                org.bouncycastle.asn1.ASN1OctetString.getInstance(it).octets
+            }
+        } catch (_: Throwable) { null }
 
         val serial = BigInteger(159, SecureRandom()).abs()
         val builder = JcaX509v3CertificateBuilder(
@@ -238,21 +216,31 @@ class MitmCa(
         )
             .addExtension(Extension.basicConstraints, true, BasicConstraints(false))
             .addExtension(Extension.subjectAlternativeName, true, GeneralNames(san))
-            .addExtension(Extension.extendedKeyUsage, false,
-                ExtendedKeyUsage(KeyPurposeId.id_kp_serverAuth))
-            .addExtension(Extension.keyUsage, true,
-                KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyEncipherment))
-            .addExtension(Extension.subjectKeyIdentifier, false,
-                utils.createSubjectKeyIdentifier(kp.public))
+            .addExtension(
+                Extension.extendedKeyUsage, false,
+                ExtendedKeyUsage(KeyPurposeId.id_kp_serverAuth)
+            )
+            .addExtension(
+                Extension.keyUsage, true,
+                KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyEncipherment)
+            )
+            .addExtension(
+                Extension.subjectKeyIdentifier, false,
+                utils.createSubjectKeyIdentifier(kp.public)
+            )
 
         if (caSkiBytes != null) {
-            builder.addExtension(Extension.authorityKeyIdentifier, false,
-                org.bouncycastle.asn1.x509.AuthorityKeyIdentifier(caSkiBytes))
+            builder.addExtension(
+                Extension.authorityKeyIdentifier, false,
+                org.bouncycastle.asn1.x509.AuthorityKeyIdentifier(caSkiBytes)
+            )
         }
 
-        // Fix #5: Pass bcProvider INSTANCE everywhere; never the string "BC".
-        val signer = JcaContentSignerBuilder("SHA256withRSA").setProvider(bcProvider).build(caKey)
-        val leafCert = JcaX509CertificateConverter().setProvider(bcProvider)
+        val signer = JcaContentSignerBuilder("SHA256withRSA")
+            .setProvider(bcProvider)
+            .build(caKey)
+        val leafCert = JcaX509CertificateConverter()
+            .setProvider(bcProvider)
             .getCertificate(builder.build(signer))
 
         lastLeaf = leafCert
@@ -262,9 +250,6 @@ class MitmCa(
         val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
         kmf.init(ks, DEFAULT_PASSWORD)
 
-        // Fix #6: Use "TLS" instead of "TLSv1.3" — the umbrella protocol
-        // negotiates the best available version and avoids NoSuchAlgorithmException
-        // on devices whose security provider doesn't expose a discrete TLSv1.3 context.
         val ctx = SSLContext.getInstance("TLS")
         ctx.init(kmf.keyManagers, null, SecureRandom())
         return ctx
