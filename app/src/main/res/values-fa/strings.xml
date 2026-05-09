@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ولوم</string>
+    <string name="app_subtitle">تونل پروکسی · نسخه ۱.۰</string>
+
+    <string name="dashboard">داشبورد</string>
+    <string name="profiles">پروفایل‌ها</string>
+    <string name="settings">تنظیمات</string>
+    <string name="logs">لاگ‌ها</string>
+
+    <string name="start_relay">شروع رله</string>
+    <string name="stop_relay">توقف رله</string>
+    <string name="start_vpn">اتصال وی‌پی‌ان</string>
+    <string name="stop_vpn">قطع وی‌پی‌ان</string>
+
+    <string name="upload">آپلود</string>
+    <string name="download">دانلود</string>
+    <string name="active_connections">اتصالات فعال</string>
+    <string name="requests_per_sec">درخواست در ثانیه</string>
+    <string name="relay_latency">تاخیر رله</string>
+    <string name="gas_latency">تاخیر GAS</string>
+    <string name="cf_latency">تاخیر کلودفلر</string>
+    <string name="cache_hit_rate">نرخ کش</string>
+
+    <string name="vpn_running">تونل ولوم فعال است</string>
+    <string name="vpn_idle">ولوم آماده به کار</string>
+    <string name="proxy_running">پروکسی محلی در حال اجراست</string>
+
+    <string name="cert_install">نصب گواهی</string>
+    <string name="cert_share">خروجی گواهی CA (.cer)</string>
+    <string name="status_connected">متصل</string>
+    <string name="status_offline">قطع</string>
+</resources>
