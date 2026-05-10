@@ -1,34 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  CRITICAL: Apps targeting SDK >= 24 (Android 7+) do NOT trust user-installed
-  CAs by default. Without this opt-in, our own SSL diagnostic test (which is
-  itself an HTTPS client running INSIDE this app) will reject the MITM leaf
-  cert signed by the user-installed Velum Root CA, producing the
-  SSLV3_ALERT_CERTIFICATE_UNKNOWN you saw in the logs.
-
-  base-config below tells Android: "for any HTTPS connection from this app,
-  trust system CAs AND user-installed CAs." This is the canonical pattern
-  documented at:
-    https://developer.android.com/privacy-and-security/security-config
-
-  Note: this only affects connections made BY THIS APP. It does not — and
-  cannot — make Chrome, Telegram, or banking apps trust your CA. Those
-  decisions belong to each app's own network_security_config or pin set.
+  CRITICAL per the Velum forensic audit (Section 4):
+  Apps targeting SDK >= 24 (Android 7+) IGNORE user-installed CAs by default.
+  Without <certificates src="user"/> below, the in-app diagnostic and any
+  HTTPS request originating from this app will reject the Velum CA with
+  SSLV3_ALERT_CERTIFICATE_UNKNOWN — even if the user installed it correctly.
 -->
 <network-security-config>
 
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
-            <!-- Standard preinstalled root CAs -->
             <certificates src="system" />
-            <!-- User-installed CAs (this is the line that fixes the FAIL) -->
             <certificates src="user" />
         </trust-anchors>
     </base-config>
 
-    <!-- Debug builds: also trust any cert dropped into res/raw/debug_cas
-         when the app is debuggable. Harmless on release builds because
-         the system enforces android:debuggable="false" there. -->
     <debug-overrides>
         <trust-anchors>
             <certificates src="user" />
