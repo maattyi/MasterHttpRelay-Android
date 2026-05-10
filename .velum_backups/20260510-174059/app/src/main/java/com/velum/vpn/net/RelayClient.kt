@@ -11,19 +11,32 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.*
-import okhttp3.*
+import okhttp3.OkHttpClient
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
-import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLSocketFactory
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
-import java.security.cert.X509Certificate
 import kotlin.math.min
 
+/**
+ * RelayClient — talks to the Google Apps Script (GAS) relay over HTTPS.
+ *
+ * SECURITY MODEL (post-refactor):
+ *   * The OkHttp instance is built by [SecureHttpClient.buildGasClient] which:
+ *       - uses ONLY the Android system trust store
+ *       - restricts to TLS 1.2 / 1.3 with MODERN_TLS cipher suites
+ *       - pins the SPKI of Google's GTS roots for script.google.com
+ *       - keeps default hostname verification ENABLED
+ *   * No trust-all manager. No HostnameVerifier override. No SNI rewrite.
+ *   * The client speaks the standard HTTPS chain to script.google.com via
+ *     the system DNS resolver. Censorship-bypass behaviour is preserved
+ *     via the GAS relay endpoint itself, not via TLS interception.
+ *
+ * If a network is actively blocking script.google.com, that is handled by
+ * the multi-id dispatcher (rotating between alternate Apps Script
+ * deployment IDs) — not by faking certificates or rewriting SNI.
+ */
 class RelayClient(
     private val cfg: RelayConfig,
     private val rcfg: RuntimeRelayConfig,
@@ -31,8 +44,6 @@ class RelayClient(
     private val onLatency: ((gas: Double, cf: Double, relay: Double) -> Unit)? = null,
 ) {
     private val gasHost = "script.google.com"
-    private val frontDomain = rcfg.frontDomain
-    private val googleIp = rcfg.googleIp
     private val authKey = rcfg.authKey
 
     private val concurrencySem = Semaphore(cfg.maxRelayConcurrency)
@@ -53,43 +64,18 @@ class RelayClient(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val http: OkHttpClient = run {
-        val trustAll: TrustManager = object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-        }
-        val ctx = SSLContext.getInstance("TLS").apply {
-            init(null, arrayOf(trustAll), java.security.SecureRandom())
-        }
-        val ssf: SSLSocketFactory = SniRewriteSocketFactory(ctx.socketFactory, frontDomain)
-
-        OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(cfg.relayTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            .writeTimeout(cfg.relayTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            .callTimeout(cfg.relayTimeoutMs.toLong() + 5_000, TimeUnit.MILLISECONDS)
-            .retryOnConnectionFailure(true)
-            .connectionPool(ConnectionPool(cfg.poolMinIdle, 45, TimeUnit.SECONDS))
-            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-            .sslSocketFactory(ssf, trustAll as X509TrustManager)
-            .hostnameVerifier { _, _ -> true }
-            .dns(object : Dns {
-                override fun lookup(hostname: String): List<java.net.InetAddress> {
-                    return try {
-                        if (hostname.equals(gasHost, ignoreCase = true)) {
-                            listOf(java.net.InetAddress.getByName(googleIp))
-                        } else {
-                            Dns.SYSTEM.lookup(hostname)
-                        }
-                    } catch (e: Throwable) {
-                        LogBus.w("Relay", "DNS lookup failed for $hostname: ${e.message}")
-                        Dns.SYSTEM.lookup(hostname)
-                    }
-                }
-            })
-            .build()
-    }
+    /**
+     * The HTTPS client used to reach the GAS relay. Built once via the
+     * hardened [SecureHttpClient]: TLS 1.2/1.3, system trust, certificate
+     * pinning on Google roots, default hostname verifier.
+     */
+    private val http: OkHttpClient = SecureHttpClient.buildGasClient(
+        connectTimeoutMs = 10_000L,
+        readTimeoutMs = cfg.relayTimeoutMs.toLong(),
+        writeTimeoutMs = cfg.relayTimeoutMs.toLong(),
+        callTimeoutMs = (cfg.relayTimeoutMs + 5_000).toLong(),
+        poolSize = cfg.poolMinIdle.coerceAtLeast(4),
+    )
 
     private val jsonMedia = "application/json".toMediaType()
 
