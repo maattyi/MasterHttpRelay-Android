@@ -1,17 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  VelumVPN AndroidManifest — production-safe baseline.
-
-  Post-refactor changes:
-    * Removed the FileProvider that exposed the on-disk MITM CA. There
-      is no longer a CA to export, so the provider has no purpose.
-    * Removed the file_paths reference from the manifest. The
-      res/xml/file_paths.xml file is left in place (harmless) so that
-      pure-XML diff tooling does not flag a missing resource.
-    * Kept the VpnService and LocalProxyService declarations intact —
-      the proxy / VPN architecture itself is unchanged, only the TLS
-      layer was hardened.
--->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
@@ -72,6 +59,17 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="local proxy" />
         </service>
+
+        <!-- FileProvider for exporting the MITM CA certificate -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.velum.vpn.provider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- Auto-start on boot (opt-in) -->
         <receiver

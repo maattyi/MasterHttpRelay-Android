@@ -9,6 +9,7 @@ import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.velum.vpn.VelumApp
 import com.velum.vpn.R
+import com.velum.vpn.cert.MitmCa
 import com.velum.vpn.core.AppContainer
 import com.velum.vpn.core.ConnectionState
 import com.velum.vpn.net.RelayClient
@@ -17,12 +18,9 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /**
- * Lightweight foreground service running the local HTTP + SOCKS5 listener
- * (no VpnService). Used for app-level proxy mode and LAN sharing.
- *
- * Post-refactor: no MitmCa, no SSLContext, no per-host leaf signing.
- * The proxy now does TCP pass-through for HTTPS so the user's app can
- * complete its real TLS handshake end-to-end with the origin.
+ * Lightweight foreground service: just runs the local HTTP + SOCKS5
+ * listener (no VpnService). Used for app-level proxy mode and for
+ * sharing the proxy to other devices on the LAN.
  */
 class LocalProxyService : LifecycleService() {
 
@@ -30,26 +28,25 @@ class LocalProxyService : LifecycleService() {
     private var http: HttpProxyServer? = null
     private var socks: Socks5Server? = null
     private var relay: RelayClient? = null
+    private lateinit var mitm: MitmCa
 
     override fun onCreate() {
         super.onCreate()
         container = (application as VelumApp).container
+        mitm = container.mitm
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         com.velum.vpn.core.LogBus.i("Proxy", "Local proxy service start command: ${intent?.action}")
         when (intent?.action) {
-            ACTION_STOP -> {
+            ACTION_STOP -> { 
                 com.velum.vpn.core.LogBus.i("Proxy", "Stopping local proxy service")
-                stopProxy(); stopSelf(); return START_NOT_STICKY
+                stopProxy(); stopSelf(); return START_NOT_STICKY 
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIF_ID, notification(),
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            )
+            startForeground(NOTIF_ID, notification(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTIF_ID, notification())
         }
@@ -65,11 +62,12 @@ class LocalProxyService : LifecycleService() {
             container.updateProxyState(ConnectionState.Idle)
             return stopSelf()
         }
+        // Fix #12: Use shared RelayClient from AppContainer
         val client = container.getOrCreateRelayClient(cfg, rcfg)
         relay = client
-        http = HttpProxyServer(cfg, client, container.stats).also { it.start() }
+        http = HttpProxyServer(cfg, client, mitm, container.stats).also { it.start() }
         if (cfg.enableSocks5) {
-            socks = Socks5Server(cfg, client, container.stats).also { it.start() }
+            socks = Socks5Server(cfg, client, container.stats, mitm).also { it.start() }
         }
         container.updateProxyState(ConnectionState.Connected)
     }
@@ -78,6 +76,8 @@ class LocalProxyService : LifecycleService() {
         container.updateProxyState(ConnectionState.Disconnecting)
         http?.stop(); http = null
         socks?.stop(); socks = null
+        // Fix #12: Don't shutdown shared relay client;
+        // AppContainer owns the lifecycle.
         relay = null
         container.updateProxyState(ConnectionState.Idle)
     }
@@ -90,11 +90,11 @@ class LocalProxyService : LifecycleService() {
     private fun notification(): Notification {
         val pi = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE,
+            PendingIntent.FLAG_IMMUTABLE
         )
         val stop = PendingIntent.getService(
             this, 1, Intent(this, LocalProxyService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE,
+            PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, VelumApp.CHANNEL_PROXY)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)

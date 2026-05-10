@@ -1,8 +1,10 @@
 package com.velum.vpn.proxy
 
+import com.velum.vpn.cert.MitmCa
 import com.velum.vpn.core.LogBus
 import com.velum.vpn.core.RelayConfig
 import com.velum.vpn.core.Stats
+import com.velum.vpn.net.PinnedHostBypass
 import com.velum.vpn.net.RelayClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -15,31 +17,13 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 
-/**
- * HttpProxyServer — local HTTP proxy that the system / VPN points at.
- *
- * SECURITY MODEL (post-refactor):
- *   * Plain HTTP requests (method != CONNECT) are forwarded through the
- *     RelayClient (GAS backend). The relay sees plaintext only because
- *     the user's app already chose to send plaintext. No interception
- *     of TLS happens here.
- *
- *   * HTTPS is handled with a CONNECT method (HTTP CONNECT tunnel). We
- *     do NOT terminate TLS, do NOT mint per-host leaf certificates, and
- *     do NOT need a user-installed CA. Instead we open a raw TCP tunnel
- *     to the upstream host and pipe bytes both directions until either
- *     side closes. The user's app performs its own end-to-end TLS
- *     handshake with the real origin — exactly as the OS designed it.
- *
- * This removes the entire MITM layer that previous Velum builds shipped.
- * Censorship-bypass behaviour is preserved by routing the *plaintext*
- * relay traffic through the GAS backend; for HTTPS, we provide a clean
- * TCP relay path so apps work without any certificate trust friction.
- */
 class HttpProxyServer(
     private val cfg: RelayConfig,
     private val relay: RelayClient,
+    private val mitm: MitmCa,
     private val stats: Stats,
 ) {
     private val tag = "VELUM-Proxy"
@@ -123,34 +107,145 @@ class HttpProxyServer(
     }
 
     /**
-     * CONNECT handler — pure TCP pass-through.
+     * CONNECT handler with split-tunnel decision.
      *
-     * No TLS interception. No leaf signing. No per-host certificates.
-     * The client's TLS handshake goes end-to-end to the real origin,
-     * which is exactly what every modern proxy server (Squid, mitmproxy
-     * in regular mode, Nginx stream module, etc.) does by default.
+     *   1. Parse target host:port.
+     *   2. If [PinnedHostBypass.shouldBypass] returns true, set up a raw
+     *      bidirectional TCP relay between the client and the upstream
+     *      server. The client's TLS handshake goes end-to-end with the
+     *      real server — Velum never sees plaintext, but the user's app
+     *      keeps working instead of breaking with a CT or pinning error.
+     *   3. Otherwise, proceed with the existing MITM path: leaf-sign per
+     *      host, decrypt, relay through GAS, re-encrypt back to client.
      */
-    private fun handleConnect(
+    private suspend fun handleConnect(
         target: String,
         client: Socket,
         input: InputStream,
         output: OutputStream,
     ) {
         val (host, port) = parseHostPort(target, 443)
-        LogBus.i(tag, "CONNECT (passthrough) -> $host:$port")
-        tunnelRaw(host, port, client, input, output)
+        LogBus.i(tag, "CONNECT -> $host:$port")
+
+        if (PinnedHostBypass.shouldBypass(host)) {
+            LogBus.i(tag, "PASSTHROUGH (pinned) -> $host:$port")
+            tunnelRaw(host, port, client, input, output)
+            return
+        }
+
+        try {
+            output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+            output.flush()
+        } catch (e: Throwable) {
+            LogBus.d(tag, "Failed to send CONNECT 200: ${e.message}")
+            return
+        }
+
+        val ctx = try {
+            mitm.contextFor(host)
+        } catch (e: Throwable) {
+            LogBus.e(tag, "MITM context for $host failed: ${e.message}", e)
+            return
+        }
+
+        val ssf: SSLSocketFactory = ctx.socketFactory
+        val tls: SSLSocket = try {
+            (ssf.createSocket(client, host, port, true) as SSLSocket).apply {
+                useClientMode = false
+                soTimeout = 60_000
+            }
+        } catch (e: Throwable) {
+            LogBus.e(tag, "TLS wrap failed for $host: ${e.message}", e)
+            return
+        }
+
+        try {
+            try {
+                tls.startHandshake()
+            } catch (e: Throwable) {
+                val msg = e.message ?: e.toString()
+                LogBus.d(tag, "TLS handshake FAILED for $host: $msg")
+                if (msg.contains("certificate_unknown", true) || msg.contains("alert", true)) {
+                    LogBus.e(
+                        tag,
+                        "Client REJECTED Velum cert for $host. Likely cause: the client " +
+                            "app does not trust user CAs (default for SDK >= 24) or " +
+                            "implements certificate pinning. Add this host to the " +
+                            "bypass list if it should pass through.",
+                    )
+                }
+                return
+            }
+
+            val tlsIn = tls.inputStream
+            val tlsOut = tls.outputStream
+
+            while (true) {
+                val firstReq = readLine(tlsIn) ?: break
+                if (firstReq.isEmpty()) continue
+
+                val rHdrs = mutableMapOf<String, String>()
+                val sb = StringBuilder().append(firstReq).append("\r\n")
+                while (true) {
+                    val line = readLine(tlsIn) ?: break
+                    sb.append(line).append("\r\n")
+                    if (line.isEmpty()) break
+                    val sep = line.indexOf(':')
+                    if (sep > 0) {
+                        rHdrs[line.substring(0, sep).trim().lowercase()] =
+                            line.substring(sep + 1).trim()
+                    }
+                }
+
+                val rParts = firstReq.split(" ", limit = 3)
+                if (rParts.size < 2) break
+                val rMethod = rParts[0]
+                val rPath = rParts[1]
+
+                val te = rHdrs["transfer-encoding"]?.lowercase()
+                val body = if (te != null && te.contains("chunked")) {
+                    runCatching { readChunkedBody(tlsIn) }.getOrDefault(ByteArray(0))
+                } else {
+                    val cl = rHdrs["content-length"]?.toIntOrNull() ?: 0
+                    if (cl > 0) runCatching { readNBytesCompat(tlsIn, cl) }
+                        .getOrDefault(ByteArray(0))
+                    else ByteArray(0)
+                }
+                stats.addUp(sb.length.toLong() + body.size)
+
+                val url = if (port == 443) "https://$host$rPath"
+                else "https://$host:$port$rPath"
+                val resp = try {
+                    relay.relaySmart(rMethod, url, rHdrs, body)
+                } catch (e: Throwable) {
+                    com.velum.vpn.net.Response.error(502, "relay error: ${e.message}")
+                }
+
+                try {
+                    val bytes = resp.toHttpBytes()
+                    tlsOut.write(bytes)
+                    tlsOut.flush()
+                    stats.addDown(bytes.size.toLong())
+                } catch (e: Throwable) {
+                    LogBus.d(tag, "TLS write failed for $host: ${e.message}")
+                    break
+                }
+            }
+        } finally {
+            runCatching { tls.close() }
+        }
     }
 
     /**
-     * Pure TCP relay between client and upstream. End-to-end TLS is
-     * preserved; Velum never sees plaintext for CONNECT-tunnelled
-     * traffic. This is the same model Android's own VpnService examples
-     * recommend for non-MITM proxies.
+     * Pinned-host passthrough. Opens a TCP connection to upstream, returns
+     * "200 Connection Established" to the client, then pipes bytes both
+     * ways until either side closes. The TLS handshake is end-to-end —
+     * Velum never has the plaintext and never has to forge a leaf.
      */
     private fun tunnelRaw(
         host: String,
         port: Int,
-        @Suppress("UNUSED_PARAMETER") client: Socket,
+        client: Socket,
         clientIn: InputStream,
         clientOut: OutputStream,
     ) {
@@ -158,7 +253,7 @@ class HttpProxyServer(
         try {
             upstream = Socket()
             upstream.tcpNoDelay = true
-            upstream.connect(InetSocketAddress(host, port), 10_000)
+            upstream.connect(InetSocketAddress(host, port), 5_000)
             upstream.soTimeout = 0
 
             try {
@@ -184,10 +279,6 @@ class HttpProxyServer(
             t2.join()
         } catch (e: Throwable) {
             LogBus.d(tag, "passthrough $host:$port failed: ${e.message}")
-            try {
-                clientOut.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
-                clientOut.flush()
-            } catch (_: Throwable) { /* client gone */ }
         } finally {
             runCatching { upstream?.close() }
         }
@@ -213,11 +304,6 @@ class HttpProxyServer(
         }
     }
 
-    /**
-     * Plain HTTP path — forwarded through the GAS relay so we get the
-     * censorship-bypass benefit. Plaintext only; nothing TLS-related
-     * happens in this branch.
-     */
     private suspend fun handleHttp(
         method: String,
         url: String,

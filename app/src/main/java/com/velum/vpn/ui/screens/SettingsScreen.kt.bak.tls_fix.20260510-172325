@@ -1,6 +1,7 @@
 package com.velum.vpn.ui.screens
 
 import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -25,20 +26,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.velum.vpn.cert.MitmCa
 import com.velum.vpn.core.AppContainer
 import com.velum.vpn.core.DiagnosticManager
 import com.velum.vpn.core.RelayConfig
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-/**
- * SettingsScreen — post-refactor.
- *
- * The "Install Root CA" / "Save to Downloads" / "Share certificate" /
- * "Dump leaf" UX was removed because Velum no longer performs MITM and
- * therefore has no certificate to install. The diagnostic card now runs
- * the production-safe 4-step probe (proxy listening, system trust store,
- * direct HTTPS to GAS with pinning, pass-through wire test).
- */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(container: AppContainer) {
@@ -46,6 +41,7 @@ fun SettingsScreen(container: AppContainer) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var working by remember(current) { mutableStateOf(current) }
+    var lastSave by remember { mutableStateOf<MitmCa.SaveResult?>(null) }
 
     Column(
         Modifier
@@ -154,18 +150,108 @@ fun SettingsScreen(container: AppContainer) {
             }
         }
 
-        SettingsSection("SECURITY") {
+        SettingsSection("CERTIFICATE") {
             Text(
-                "VelumVPN uses standard Android TLS validation against the system " +
-                    "trust store. No root-CA install is required and no MITM is " +
-                    "performed. HTTPS traffic is tunnelled end-to-end to the origin.",
+                "Save the Velum Root CA to your Downloads folder, then install it from " +
+                    "Settings -> Security -> Encryption & credentials -> Install a certificate -> CA certificate.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
             )
 
+            // Result panel — green on save, red on failure.
+            val saved = lastSave
+            if (saved != null) {
+                Spacer(Modifier.height(4.dp))
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            if (saved.success) Color(0xFF1B5E20) else Color(0xFFB71C1C),
+                        )
+                        .padding(12.dp),
+                ) {
+                    Column {
+                        Text(
+                            saved.message,
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                        )
+                        val detail = saved.detail
+                        if (!detail.isNullOrBlank()) {
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                detail,
+                                color = Color.White.copy(alpha = 0.85f),
+                                fontSize = 12.sp,
+                                lineHeight = 16.sp,
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(Modifier.height(8.dp))
-            DiagnosticsCard(proxyPort = working.listenPort)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VelumButton(
+                    label = "SAVE TO DOWNLOADS",
+                    onClick = {
+                        scope.launch {
+                            // Save off the main thread; MediaStore I/O can stutter UI.
+                            val result = withContext(Dispatchers.IO) {
+                                container.mitm.saveCertificateToDownloads()
+                            }
+                            lastSave = result
+                            Toast.makeText(
+                                ctx,
+                                if (result.success) result.message else "Save failed",
+                                Toast.LENGTH_LONG,
+                            ).show()
+
+                            // On success, also fire the system Install Certificate UI.
+                            if (result.success) {
+                                runCatching {
+                                    val intent = container.mitm.exportCertificate()
+                                    ctx.startActivity(intent)
+                                }
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+                VelumButton(
+                    label = "SHARE",
+                    onClick = {
+                        scope.launch {
+                            runCatching {
+                                val intent = container.mitm.shareCertificate()
+                                ctx.startActivity(Intent.createChooser(intent, "Save CA Certificate"))
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            Spacer(Modifier.height(12.dp))
+
+            DiagnosticsCard(
+                proxyPort = working.listenPort,
+                onDumpLeaf = {
+                    scope.launch {
+                        runCatching {
+                            val intent = container.mitm.dumpLastLeaf()
+                            if (intent != null) {
+                                ctx.startActivity(Intent.createChooser(intent, "Share Leaf Cert"))
+                            }
+                        }
+                    }
+                },
+            )
         }
 
         SettingsSection("ABOUT") {
@@ -217,7 +303,10 @@ fun SettingsScreen(container: AppContainer) {
 }
 
 @Composable
-private fun DiagnosticsCard(proxyPort: Int) {
+private fun DiagnosticsCard(
+    proxyPort: Int,
+    onDumpLeaf: () -> Unit,
+) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -225,16 +314,13 @@ private fun DiagnosticsCard(proxyPort: Int) {
     var loading by remember { mutableStateOf(false) }
 
     Text(
-        "TLS / Connectivity Diagnostics",
+        "SSL Diagnostics",
         color = MaterialTheme.colorScheme.onSurface,
         fontSize = 14.sp,
         fontWeight = FontWeight.Bold,
     )
     Text(
-        "Runs a 4-step health probe: local proxy, system trust store, direct " +
-            "TLS handshake to script.google.com (with cert pinning), and a " +
-            "pass-through wire test through the proxy. Start the proxy/VPN " +
-            "before pressing RUN.",
+        "Probes the local proxy with a real HTTPS request. Make sure the proxy/VPN is running before pressing RUN.",
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         fontSize = 12.sp,
     )
@@ -270,36 +356,46 @@ private fun DiagnosticsCard(proxyPort: Int) {
         }
     }
 
-    Button(
-        onClick = {
-            scope.launch {
-                loading = true
-                result = try {
-                    DiagnosticManager(ctx).runTest(proxyPort)
-                } catch (e: Throwable) {
-                    DiagnosticManager.Result(
-                        success = false,
-                        message = "Diagnostic crashed",
-                        detail = e.message ?: e.toString(),
-                    )
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(
+            onClick = {
+                scope.launch {
+                    loading = true
+                    result = try {
+                        DiagnosticManager(ctx).runTest(proxyPort)
+                    } catch (e: Throwable) {
+                        DiagnosticManager.Result(
+                            success = false,
+                            message = "Diagnostic crashed",
+                            detail = e.message ?: e.toString(),
+                        )
+                    }
+                    loading = false
                 }
-                loading = false
+            },
+            modifier = Modifier.weight(1f),
+            enabled = !loading,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.secondary,
+            ),
+        ) {
+            if (loading) {
+                CircularProgressIndicator(
+                    Modifier.size(18.dp),
+                    color = Color.White,
+                    strokeWidth = 2.dp,
+                )
+            } else {
+                Text("RUN SSL TEST", fontWeight = FontWeight.Bold)
             }
-        },
-        modifier = Modifier.fillMaxWidth(),
-        enabled = !loading,
-        colors = ButtonDefaults.buttonColors(
-            containerColor = MaterialTheme.colorScheme.secondary,
-        ),
-    ) {
-        if (loading) {
-            CircularProgressIndicator(
-                Modifier.size(18.dp),
-                color = Color.White,
-                strokeWidth = 2.dp,
-            )
-        } else {
-            Text("RUN DIAGNOSTICS", fontWeight = FontWeight.Bold)
+        }
+
+        OutlinedButton(
+            onClick = onDumpLeaf,
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Text("DUMP LEAF", fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -405,9 +501,9 @@ private fun VelumButton(
     ) {
         Text(
             label,
-            fontWeight = FontWeight.Bold,
-            fontSize = if (big) 16.sp else 14.sp,
-            letterSpacing = 0.5.sp,
+            fontWeight = FontWeight.ExtraBold,
+            letterSpacing = 1.sp,
+            fontSize = if (big) 15.sp else 14.sp,
         )
     }
 }

@@ -10,6 +10,7 @@ import com.velum.vpn.core.LogBus
 import androidx.core.app.NotificationCompat
 import com.velum.vpn.VelumApp
 import com.velum.vpn.R
+import com.velum.vpn.cert.MitmCa
 import com.velum.vpn.core.AppContainer
 import com.velum.vpn.core.ConnectionState
 import com.velum.vpn.net.RelayClient
@@ -20,20 +21,19 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 
 /**
- * RelayVpnService — system-wide VpnService.
+ * System-wide VpnService. Establishes a local TUN, then redirects all
+ * outgoing TCP/UDP through a transparent HTTP proxy that itself relays
+ * through GAS / Cloudflare. Per-app filtering and split tunneling are
+ * applied via VpnService.Builder.add{Allowed|Disallowed}Application().
  *
- * Establishes a local TUN, runs the local HTTP + SOCKS5 listeners, and
- * (on API 29+) sets the system-proxy field of the VPN so apps that honour
- * a system HTTP proxy route through us. Apps that bypass the system proxy
- * (Chrome QUIC, native sockets) continue to work end-to-end via the
- * normal Android networking stack — they simply do not benefit from the
- * GAS relay.
- *
- * Post-refactor: no MitmCa dependency. The proxy is a clean tunnel:
- *   * plain HTTP -> GAS relay
- *   * HTTPS CONNECT -> raw TCP pass-through (end-to-end TLS preserved)
- *
- * No certificate issuance, no user CA install required.
+ * Strategy:
+ *   1. Establish TUN with Builder.
+ *   2. Start the in-process HttpProxyServer + Socks5Server on
+ *      127.0.0.1.
+ *   3. Configure the system proxy through the TUN's HTTP_PROXY field
+ *      (Android 10+ honours this). Fallback for older devices: leave
+ *      the user with the local proxy listener and let them set the
+ *      system Wi-Fi proxy manually (we surface the IP/port in the UI).
  */
 class RelayVpnService : VpnService() {
 
@@ -43,25 +43,24 @@ class RelayVpnService : VpnService() {
     private var socks: Socks5Server? = null
     private var relay: RelayClient? = null
     private lateinit var container: AppContainer
+    private lateinit var mitm: MitmCa
 
     override fun onCreate() {
         super.onCreate()
         container = (application as VelumApp).container
+        mitm = container.mitm
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         LogBus.i(TAG, "VPN service start command: ${intent?.action}")
         when (intent?.action) {
-            ACTION_STOP -> {
+            ACTION_STOP -> { 
                 LogBus.i(TAG, "Stopping VPN service")
-                stopVpn(); stopSelf(); return START_NOT_STICKY
+                stopVpn(); stopSelf(); return START_NOT_STICKY 
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIF_ID, notification(true),
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            )
+            startForeground(NOTIF_ID, notification(true), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTIF_ID, notification(true))
         }
@@ -80,11 +79,12 @@ class RelayVpnService : VpnService() {
             stopSelf(); return
         }
 
+        // Fix #12: Use shared RelayClient from AppContainer
         val client = container.getOrCreateRelayClient(cfg, rcfg)
         relay = client
-        http = HttpProxyServer(cfg, client, container.stats).also { it.start() }
+        http = HttpProxyServer(cfg, client, mitm, container.stats).also { it.start() }
         if (cfg.enableSocks5) {
-            socks = Socks5Server(cfg, client, container.stats).also { it.start() }
+            socks = Socks5Server(cfg, client, container.stats, mitm).also { it.start() }
         }
 
         try {
@@ -98,16 +98,24 @@ class RelayVpnService : VpnService() {
     }
 
     private fun buildTun(cfg: com.velum.vpn.core.RelayConfig): ParcelFileDescriptor {
-        // System-proxy mode: TUN exists primarily to host setHttpProxy().
-        // We do not addRoute(0/0) because there is no userspace TCP/IP
-        // stack reading the FD — that would blackhole traffic.
+        // Fix #8: This is "system-proxy mode" — not a true VPN tunnel.
+        // Without addRoute("0.0.0.0", 0) and a tun2socks raw stack reading the FD,
+        // only apps that honour the system proxy (setHttpProxy) are covered.
+        // Chrome's QUIC stack, native SDKs, Telegram, and any OkHttp client
+        // that uses Proxy.NO_PROXY will bypass this entirely.
+        // TODO(medium-term): Integrate hev-socks5-tunnel (JNI) or tun2socks
+        //   for real userspace TCP/IP, then add addRoute("0.0.0.0", 0) and
+        //   addDnsServer("1.1.1.1") + setUnderlyingNetworks for metered accounting.
         val builder = Builder()
             .setSession("VelumVPN (System Proxy)")
             .setMtu(1500)
             .addAddress("10.111.222.1", 24)
-            .addRoute("10.111.222.1", 32) // dummy route to keep VPN alive
+            // Do not addRoute("0.0.0.0", 0) because we lack a tun2socks raw TCP/IP stack.
+            // Routing everything to TUN without reading the FD causes a traffic blackhole.
+            .addRoute("10.111.222.1", 32) // Dummy route to keep VPN alive
             .setBlocking(false)
 
+        // Per-app routing
         if (cfg.perAppMode) {
             if (cfg.allowedApps.isNotEmpty()) {
                 cfg.allowedApps.forEach { runCatching { builder.addAllowedApplication(it) } }
@@ -115,9 +123,13 @@ class RelayVpnService : VpnService() {
                 cfg.disallowedApps.forEach { runCatching { builder.addDisallowedApplication(it) } }
             }
         }
+        // Always exclude this app to avoid recursion
         runCatching { builder.addDisallowedApplication(packageName) }
 
+        // Split tunnel: any IP listed here goes direct (not through TUN)
         cfg.splitTunnelDirectIps.forEach { ip ->
+            // Builder.excludeRoute requires API 33; on older devices fall back
+            // to per-app exclusion (no IP-level exclusion possible).
             if (Build.VERSION.SDK_INT >= 33) {
                 runCatching {
                     builder.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName(ip), 32))
@@ -125,18 +137,23 @@ class RelayVpnService : VpnService() {
             }
         }
 
+        // System proxy: Android 10+ supports VpnService.Builder.setHttpProxy
+        // This is the ONLY traffic capture mechanism in current mode.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setHttpProxy(
-                android.net.ProxyInfo.buildDirectProxy("127.0.0.1", cfg.listenPort),
-            )
+            builder.setHttpProxy(android.net.ProxyInfo.buildDirectProxy(
+                "127.0.0.1", cfg.listenPort
+            ))
         }
+        // Fix #8: DNS & metered-network accounting for system-proxy mode
         builder.addDnsServer("1.1.1.1")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val cm = getSystemService(android.net.ConnectivityManager::class.java)
-            val active = cm?.activeNetwork
-            if (active != null) builder.setUnderlyingNetworks(arrayOf(active))
+            val active = cm.activeNetwork
+            if (active != null) {
+                builder.setUnderlyingNetworks(arrayOf(active))
+            }
         }
-        LogBus.w(TAG, "VPN started in SYSTEM-PROXY mode. Apps honouring the system proxy will be covered.")
+        LogBus.w(TAG, "VPN started in SYSTEM-PROXY mode. Only apps honouring the system proxy will be covered.")
         return builder.establish() ?: error("VpnService.establish() returned null")
     }
 
@@ -145,6 +162,8 @@ class RelayVpnService : VpnService() {
         runCatching { tun?.close() }; tun = null
         http?.stop(); http = null
         socks?.stop(); socks = null
+        // Fix #12: Don't shutdown shared relay client here;
+        // let AppContainer own the lifecycle.
         relay = null
         container.updateVpnState(ConnectionState.Idle)
     }
@@ -163,11 +182,11 @@ class RelayVpnService : VpnService() {
     private fun notification(running: Boolean): Notification {
         val pi = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE,
+            PendingIntent.FLAG_IMMUTABLE
         )
         val stop = PendingIntent.getService(
             this, 2, Intent(this, RelayVpnService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE,
+            PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, VelumApp.CHANNEL_VPN)
             .setSmallIcon(android.R.drawable.stat_sys_vp_phone_call)
@@ -180,7 +199,7 @@ class RelayVpnService : VpnService() {
     }
 
     companion object {
-        private const val TAG = "VELUM-VPN"
+        private const val TAG = "MR-VPN"
         const val NOTIF_ID = 0xBABE
         const val ACTION_STOP = "com.velum.vpn.STOP_VPN"
     }

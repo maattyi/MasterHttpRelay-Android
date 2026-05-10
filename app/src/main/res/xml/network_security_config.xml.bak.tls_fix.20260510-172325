@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CRITICAL per the Velum forensic audit (Section 4):
+  Apps targeting SDK >= 24 (Android 7+) IGNORE user-installed CAs by default.
+  Without <certificates src="user"/> below, the in-app diagnostic and any
+  HTTPS request originating from this app will reject the Velum CA with
+  SSLV3_ALERT_CERTIFICATE_UNKNOWN — even if the user installed it correctly.
+-->
+<network-security-config>
+
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="user" />
+            <certificates src="system" />
+        </trust-anchors>
+    </debug-overrides>
+
+</network-security-config>

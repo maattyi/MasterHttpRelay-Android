@@ -24,25 +24,6 @@ import javax.net.ssl.X509TrustManager
 import java.security.cert.X509Certificate
 import kotlin.math.min
 
-/**
- * Android port of the V3 relay engine.
- *
- * Wire-protocol identical to the Python desktop client.  Differences:
- *   - OkHttp owns the connection pool & HTTP/2 multiplexing (it's already
- *     production-grade, no need to re-implement h2 manually)
- *   - Two-tier batch window (5 ms micro / 50 ms macro) restored from V1.2
- *   - youtube_via_relay flag pass-through (V2 fix retained)
- *   - Single-attempt retry, no retry storms
- *   - Coalescing of concurrent identical GETs
- *   - Parallel range download (16-way) for likely large files
- *
- * Fix #1 (deadlock): Removed runBlocking from coalescedSubmit — it was
- * pinning OkHttp dispatcher threads and starving the pool under load.
- * Fix #2 (TOCTOU race): Coalescing now uses ConcurrentHashMap.compute so
- * leader self-registration and follower attachment happen atomically.
- * Fix #3 (O(N²) memory blowup): Parallel range assembly uses a pre-sized
- * ByteArray + System.arraycopy instead of `parts.fold { acc, p -> acc + p }`.
- */
 class RelayClient(
     private val cfg: RelayConfig,
     private val rcfg: RuntimeRelayConfig,
@@ -60,27 +41,10 @@ class RelayClient(
     private val batchPending = mutableListOf<PendingRequest>()
     private var batchTimerJob: Job? = null
     @Volatile private var batchEnabled = true
-    private var batchDisabledAt = 0L          // Fix #4: timestamp when batch was disabled
-    private val batchReEnableMs = 30_000L    // re-enable after 30 s
-    private var consecutiveBatchFails = 0    // Fix #4: count failures before disabling
+    private var batchDisabledAt = 0L
+    private val batchReEnableMs = 30_000L
+    private var consecutiveBatchFails = 0
 
-    // ── Coalescing (Fix #1 + #2: atomic compute, no runBlocking) ──
-    //
-    // Why a data class with leader+followers:
-    //   * The thread that wins ConcurrentHashMap.compute becomes the leader
-    //     and takes ownership of executing the request.
-    //   * Subsequent callers atomically attach their own deferred to the
-    //     followers list inside the same compute lambda — no TOCTOU window
-    //     between "is anyone running this URL?" and "register myself".
-    //   * The leader fans the result out to every follower deferred.
-    //
-    // Why no runBlocking:
-    //   * The previous `return runBlocking { def.await() }` was being called
-    //     from coroutines already running on Dispatchers.IO. Each follower
-    //     pinned an entire OkHttp dispatcher thread for the duration of the
-    //     leader's network request. Once enough follower coroutines piled up
-    //     (~64 by default) the dispatcher was fully starved and every new
-    //     relay submission deadlocked. We now use suspend `await()` directly.
     private data class CoalesceEntry(
         val leaderDef: CompletableDeferred<Response>,
         val followers: MutableList<CompletableDeferred<Response>> = mutableListOf(),
@@ -89,11 +53,6 @@ class RelayClient(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    /**
-     * OkHttp client tuned for the relay path. The custom DNS overrides
-     * `script.google.com` to the configured googleIp so the TCP connection
-     * lands on Google's edge while TLS SNI uses [frontDomain].
-     */
     private val http: OkHttpClient = run {
         val trustAll: TrustManager = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
@@ -117,10 +76,16 @@ class RelayClient(
             .hostnameVerifier { _, _ -> true }
             .dns(object : Dns {
                 override fun lookup(hostname: String): List<java.net.InetAddress> {
-                    if (hostname.equals(gasHost, ignoreCase = true)) {
-                        return listOf(java.net.InetAddress.getByName(googleIp))
+                    return try {
+                        if (hostname.equals(gasHost, ignoreCase = true)) {
+                            listOf(java.net.InetAddress.getByName(googleIp))
+                        } else {
+                            Dns.SYSTEM.lookup(hostname)
+                        }
+                    } catch (e: Throwable) {
+                        LogBus.w("Relay", "DNS lookup failed for $hostname: ${e.message}")
+                        Dns.SYSTEM.lookup(hostname)
                     }
-                    return Dns.SYSTEM.lookup(hostname)
                 }
             })
             .build()
@@ -143,53 +108,58 @@ class RelayClient(
     )
 
     init {
-        multiId.configure(
-            rcfg.scriptIds,
-            failThreshold = cfg.multiIdFailThreshold,
-            cooldownSec = cfg.multiIdCooldownSec.toLong(),
-        )
+        runCatching {
+            multiId.configure(
+                rcfg.scriptIds,
+                failThreshold = cfg.multiIdFailThreshold,
+                cooldownSec = cfg.multiIdCooldownSec.toLong(),
+            )
+        }
     }
 
     fun shutdown() {
-        scope.cancel()
-        http.dispatcher.executorService.shutdown()
-        http.connectionPool.evictAll()
+        runCatching { scope.cancel() }
+        runCatching { http.dispatcher.executorService.shutdown() }
+        runCatching { http.connectionPool.evictAll() }
     }
 
-    /**
-     * Public entrypoint: relay an HTTP request through GAS.
-     * Returns a synthetic [Response] containing the upstream status / headers / body.
-     */
     suspend fun relay(
         method: String,
         url: String,
         headers: Map<String, String>,
         body: ByteArray = ByteArray(0),
     ): Response {
-        val payload = buildPayload(method, url, headers, body)
-        val hasRange = headers.keys.any { it.equals("range", true) }
-        if (method.equals("GET", true) && body.isEmpty() && !hasRange) {
-            return coalescedSubmit(url, payload)
+        return try {
+            val payload = buildPayload(method, url, headers, body)
+            val hasRange = headers.keys.any { it.equals("range", true) }
+            if (method.equals("GET", true) && body.isEmpty() && !hasRange) {
+                coalescedSubmit(url, payload)
+            } else {
+                batchSubmit(payload)
+            }
+        } catch (e: Throwable) {
+            LogBus.e("Relay", "relay() top-level failure: ${e.message}", e)
+            Response.error(502, "relay error: ${e.message ?: e.toString()}")
         }
-        return batchSubmit(payload)
     }
 
-    /**
-     * Smart relay strategy: parallel range fetch for likely large downloads,
-     * single relay otherwise. Mirrors the desktop ProxyServer._relay_smart.
-     */
     suspend fun relaySmart(
         method: String, url: String, headers: Map<String, String>, body: ByteArray,
     ): Response {
-        if (method.equals("GET", true) && body.isEmpty()) {
-            if (headers.keys.any { it.equals("range", true) }) {
-                return relay(method, url, headers, body)
+        return try {
+            if (method.equals("GET", true) && body.isEmpty()) {
+                if (headers.keys.any { it.equals("range", true) }) {
+                    return relay(method, url, headers, body)
+                }
+                if (isLikelyDownload(url)) {
+                    return relayParallel(method, url, headers, body)
+                }
             }
-            if (isLikelyDownload(url)) {
-                return relayParallel(method, url, headers, body)
-            }
+            relay(method, url, headers, body)
+        } catch (e: Throwable) {
+            LogBus.e("Relay", "relaySmart() failure: ${e.message}", e)
+            Response.error(502, "relay error: ${e.message ?: e.toString()}")
         }
-        return relay(method, url, headers, body)
     }
 
     private fun isLikelyDownload(url: String): Boolean {
@@ -199,8 +169,9 @@ class RelayClient(
     }
 
     private fun isYoutubeUrl(url: String): Boolean {
-        val host = try { URI(url).host?.lowercase()?.trimEnd('.') ?: return false }
-                   catch (_: Exception) { return false }
+        val host = try {
+            URI(url).host?.lowercase()?.trimEnd('.') ?: return false
+        } catch (_: Throwable) { return false }
         return youtubeSuffixes.any { host == it || host.endsWith(".$it") }
     }
 
@@ -224,69 +195,34 @@ class RelayClient(
         }
     }
 
-    // ── Coalescing (Fix #1 + #2: atomic compute, no runBlocking) ──────
-
-    /**
-     * If multiple coroutines submit the same GET URL concurrently, only ONE
-     * of them performs the network round-trip; the rest suspend on the
-     * leader's deferred and receive the same response.
-     *
-     * The whole "register or attach" decision happens inside a single
-     * ConcurrentHashMap.compute call, which is atomic — there is no window
-     * during which two callers could both decide they're the leader.
-     */
     private suspend fun coalescedSubmit(url: String, payload: JsonObject): Response {
         val mine = CompletableDeferred<Response>()
-        val entry = coalesce.compute(url) { _, existing ->
+        val entry: CoalesceEntry = coalesce.compute(url) { _, existing ->
             if (existing != null) {
-                // Leader already running. Attach as follower atomically.
                 existing.followers += mine
                 existing
             } else {
-                // No leader yet — we are the leader.
                 CoalesceEntry(leaderDef = mine)
             }
-        }!!
+        } ?: return Response.error(502, "coalesce returned null")
 
-        // Follower path: leader is someone else, just await their result.
         if (entry.leaderDef !== mine) {
             return mine.await()
         }
 
-        // Leader path: execute the request and fan the result out.
         return try {
             val r = batchSubmit(payload)
-            // Snapshot followers *before* removing the entry, then remove
-            // before completing so any late follower computes a fresh leader.
-            val followersSnapshot: List<CompletableDeferred<Response>>
-            coalesce.compute(url) { _, e ->
-                followersSnapshot_capture(e).also { /* no-op */ }
-                null
-            }
-            // Note: compute(_, e -> null) removes the key. We re-snapshot
-            // followers via the read-modify path above; if anything went
-            // wrong the local entry reference still has the followers list.
-            val followers = entry.followers
-            for (f in followers) f.complete(r)
+            coalesce.remove(url)
+            for (f in entry.followers) runCatching { f.complete(r) }
             entry.leaderDef.complete(r)
             r
         } catch (e: Throwable) {
             coalesce.remove(url)
-            for (f in entry.followers) f.completeExceptionally(e)
+            for (f in entry.followers) runCatching { f.completeExceptionally(e) }
             entry.leaderDef.completeExceptionally(e)
             throw e
         }
     }
-
-    /**
-     * Helper kept private to make the leader cleanup paths readable.
-     * Always returns the followers list of the entry (or empty if null).
-     */
-    @Suppress("FunctionName")
-    private fun followersSnapshot_capture(e: CoalesceEntry?): List<CompletableDeferred<Response>> =
-        e?.followers?.toList() ?: emptyList()
-
-    // ── Batching ──────────────────────────────────────────────────────
 
     private data class PendingRequest(
         val payload: JsonObject,
@@ -294,7 +230,6 @@ class RelayClient(
     )
 
     private suspend fun batchSubmit(payload: JsonObject): Response {
-        // Fix #4: TTL-based re-enable for batchEnabled
         if (!batchEnabled) {
             if (System.currentTimeMillis() - batchDisabledAt > batchReEnableMs) {
                 batchEnabled = true
@@ -351,32 +286,29 @@ class RelayClient(
             try {
                 item.deferred.complete(relayWithRetry(item.payload))
             } catch (e: Throwable) {
-                item.deferred.complete(Response.error(502, "relay error: $e"))
+                runCatching { item.deferred.complete(Response.error(502, "relay error: ${e.message}")) }
             }
             return
         }
         try {
             val results = relayBatch(batch.map { it.payload })
-            results.forEachIndexed { i, r -> batch[i].deferred.complete(r) }
+            results.forEachIndexed { i, r -> runCatching { batch[i].deferred.complete(r) } }
         } catch (e: Throwable) {
-            // Fix #4: disable batching after consecutive failures, with TTL re-enable
             consecutiveBatchFails++
             if (consecutiveBatchFails >= 3 && batchEnabled) {
                 batchEnabled = false
                 batchDisabledAt = System.currentTimeMillis()
-                LogBus.w("Relay", "Batching disabled after $consecutiveBatchFails failures; re-enabling in ${batchReEnableMs}ms")
+                LogBus.w("Relay", "Batching disabled after $consecutiveBatchFails fails; TTL ${batchReEnableMs}ms")
             }
             for (item in batch) {
                 try {
                     item.deferred.complete(relayWithRetry(item.payload))
                 } catch (e2: Throwable) {
-                    item.deferred.complete(Response.error(502, e2.message ?: "relay error"))
+                    runCatching { item.deferred.complete(Response.error(502, e2.message ?: "relay error")) }
                 }
             }
         }
     }
-
-    // ── Core relay path ───────────────────────────────────────────────
 
     private suspend fun relayWithRetry(payload: JsonObject): Response = concurrencySem.withPermit {
         var last: Throwable? = null
@@ -388,11 +320,11 @@ class RelayClient(
                 val resp = postJson(execPath(sid), payload)
                 val latency = (System.currentTimeMillis() - t0).toDouble()
                 multiId.reportOk(sid, latency)
-                onLatency?.invoke(latency, parseCfLatency(resp), latency)
+                runCatching { onLatency?.invoke(latency, parseCfLatency(resp), latency) }
                 return parseRelayResponse(resp.body)
             } catch (e: Throwable) {
                 last = e
-                multiId.reportErr(sid)
+                runCatching { multiId.reportErr(sid) }
             }
         }
         throw last ?: RuntimeException("relay failed")
@@ -410,21 +342,20 @@ class RelayClient(
             val raw = postJson(execPath(sid), body)
             val latency = (System.currentTimeMillis() - t0).toDouble()
             multiId.reportOk(sid, latency)
-            onLatency?.invoke(latency, parseCfLatency(raw), latency)
+            runCatching { onLatency?.invoke(latency, parseCfLatency(raw), latency) }
             val text = raw.body.toString(Charsets.UTF_8).trim()
             val data = Json.parseToJsonElement(text).jsonObject
             data["e"]?.let { throw RuntimeException("batch error: $it") }
             val items = data["q"]?.jsonArray ?: throw RuntimeException("missing q[]")
             return items.map { parseRelayJson(it.jsonObject) }
         } catch (e: Throwable) {
-            multiId.reportErr(sid)
+            runCatching { multiId.reportErr(sid) }
             throw e
         }
     }
 
     private fun execPath(sid: String) = "/macros/s/$sid/exec"
 
-    /** Sends a single POST request with auth key injection. */
     private suspend fun postJson(path: String, payload: JsonObject): RawResponse =
         withContext(Dispatchers.IO) {
             val withKey = JsonObject(payload + ("k" to JsonPrimitive(authKey)))
@@ -447,8 +378,9 @@ class RelayClient(
     private fun parseRelayResponse(body: ByteArray): Response {
         val text = body.toString(Charsets.UTF_8).trim()
         if (text.isEmpty()) return Response.error(502, "empty relay response")
-        val data = try { Json.parseToJsonElement(text).jsonObject }
-                   catch (e: Throwable) { return Response.error(502, "bad relay JSON: $e") }
+        val data = try {
+            Json.parseToJsonElement(text).jsonObject
+        } catch (e: Throwable) { return Response.error(502, "bad relay JSON: ${e.message}") }
         return parseRelayJson(data)
     }
 
@@ -466,12 +398,10 @@ class RelayClient(
             }
         }
         val bodyB64 = (data["b"] as? JsonPrimitive)?.contentOrNull ?: ""
-        val body = if (bodyB64.isEmpty()) ByteArray(0)
-                   else Base64.decode(bodyB64, Base64.DEFAULT)
-        return Response(status, headers, body)
+        val parsedBody = if (bodyB64.isEmpty()) ByteArray(0)
+        else try { Base64.decode(bodyB64, Base64.DEFAULT) } catch (_: Throwable) { ByteArray(0) }
+        return Response(status, headers, parsedBody)
     }
-
-    // ── Parallel range download ───────────────────────────────────────
 
     suspend fun relayParallel(
         method: String, url: String, headers: Map<String, String>, body: ByteArray,
@@ -496,7 +426,6 @@ class RelayClient(
             start = end + 1
         }
         val sem = Semaphore(maxParallel)
-        // Preserve ordering: parts[0] == first.body, parts[i+1] == ranges[i] result.
         val parts = ArrayList<ByteArray>(ranges.size + 1)
         parts.add(first.body)
         coroutineScope {
@@ -510,26 +439,16 @@ class RelayClient(
                                 val r = relay("GET", url, rh, ByteArray(0))
                                 val expected = (e - s + 1).toInt()
                                 if (r.body.size == expected) return@withPermit r.body
-                            } catch (t: Throwable) {
-                                lastErr = t
-                            }
+                            } catch (t: Throwable) { lastErr = t }
                             delay(300L * (attempt + 1))
                         }
                         throw RuntimeException("range $s-$e failed", lastErr)
                     }
                 }
             }
-            // Append in order so the assembled file is byte-correct.
             for (d in deferreds) parts.add(d.await())
         }
 
-        // Fix #3: O(N) assembly. The previous fold(ByteArray(0)) { acc, p -> acc + p }
-        // allocated a new ByteArray of length acc.size + p.size on every step,
-        // i.e. O(N²) total bytes copied for a file of N chunks. For a 1 GB
-        // download split into 16 MB chunks (~64 chunks) that previously meant
-        // ~33 GB of allocations + GC churn and frequent OOM. Now we sum sizes
-        // once, allocate the destination once, and System.arraycopy each chunk
-        // into its slot — strictly O(total_size).
         val totalBytes = parts.sumOf { it.size }
         val full = ByteArray(totalBytes)
         var off = 0
@@ -570,7 +489,6 @@ data class Response(
             Response(status, mapOf("Content-Type" to "text/plain"), message.toByteArray())
     }
 
-    /** Materialise as raw HTTP/1.1 wire bytes (used by the proxy/VPN layer). */
     fun toHttpBytes(): ByteArray {
         val sb = StringBuilder()
         val statusText = when (status) {
@@ -582,8 +500,10 @@ data class Response(
             else -> "OK"
         }
         sb.append("HTTP/1.1 $status $statusText\r\n")
-        val skip = setOf("transfer-encoding", "connection", "keep-alive",
-                         "content-length", "content-encoding")
+        val skip = setOf(
+            "transfer-encoding", "connection", "keep-alive",
+            "content-length", "content-encoding"
+        )
         for ((k, v) in headers) {
             if (k.lowercase() in skip) continue
             sb.append("$k: $v\r\n")
